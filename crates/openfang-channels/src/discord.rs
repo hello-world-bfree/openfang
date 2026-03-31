@@ -3,15 +3,18 @@
 //! Uses Discord Gateway WebSocket (v10) for receiving messages and the REST API
 //! for sending responses. No external Discord crate — just `tokio-tungstenite` + `reqwest`.
 
+use crate::bridge::channel_command_specs;
 use crate::types::{
     split_message, ChannelAdapter, ChannelContent, ChannelMessage, ChannelType, ChannelUser,
 };
 use async_trait::async_trait;
+use chrono::Utc;
+use dashmap::DashMap;
 use futures::{SinkExt, Stream, StreamExt};
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch, RwLock};
 use tracing::{debug, error, info, warn};
 use zeroize::Zeroizing;
@@ -20,6 +23,68 @@ const DISCORD_API_BASE: &str = "https://discord.com/api/v10";
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const DISCORD_MSG_LIMIT: usize = 2000;
+/// Maximum pending interactions before rejecting new ones.
+const MAX_PENDING_INTERACTIONS: usize = 500;
+/// TTL for pending interaction contexts (Discord tokens expire at 15 min).
+const INTERACTION_TTL: Duration = Duration::from_secs(840);
+
+// ---------------------------------------------------------------------------
+// Security helpers
+// ---------------------------------------------------------------------------
+
+/// Build an `Authorization: Bot {token}` header marked as sensitive so HTTP
+/// tracing / logging middleware will not leak the bot token.
+fn bot_auth_header(token: &str) -> reqwest::header::HeaderValue {
+    let mut val = reqwest::header::HeaderValue::from_str(&format!("Bot {token}"))
+        .expect("bot token produced an invalid header value");
+    val.set_sensitive(true);
+    val
+}
+
+/// Validate a Discord snowflake ID (17-20 ASCII digit string).
+fn is_valid_snowflake(s: &str) -> bool {
+    let len = s.len();
+    (17..=20).contains(&len) && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+// ---------------------------------------------------------------------------
+// Interaction types
+// ---------------------------------------------------------------------------
+
+/// Tracks a pending Discord interaction awaiting a deferred response.
+///
+/// Written by the ACK worker after successfully acknowledging the interaction.
+/// Read/removed by `send()` to route the response through the webhook endpoint.
+struct InteractionContext {
+    interaction_id: String,
+    /// SENSITIVE — redacted in Debug to prevent log leakage.
+    interaction_token: String,
+    application_id: String,
+    /// Channel where the interaction originated (for fallback to regular message).
+    channel_id: String,
+    created_at: Instant,
+}
+
+impl std::fmt::Debug for InteractionContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InteractionContext")
+            .field("interaction_id", &self.interaction_id)
+            .field("interaction_token", &"[REDACTED]")
+            .field("application_id", &self.application_id)
+            .field("channel_id", &self.channel_id)
+            .finish()
+    }
+}
+
+/// Payload sent from the gateway loop to the ACK worker task.
+struct InteractionPayload {
+    interaction_id: String,
+    interaction_token: String,
+    application_id: String,
+    channel_id: String,
+    /// Pre-built message forwarded to the bridge after a successful ACK.
+    message: ChannelMessage,
+}
 
 /// Discord Gateway opcodes.
 mod opcode {
@@ -46,10 +111,15 @@ pub struct DiscordAdapter {
     shutdown_rx: watch::Receiver<bool>,
     /// Bot's own user ID (populated after READY event).
     bot_user_id: Arc<RwLock<Option<String>>>,
+    /// Application ID from READY event (NOT always the same as bot_user_id).
+    application_id: Arc<RwLock<Option<String>>>,
     /// Session ID for resume (populated after READY event).
     session_id: Arc<RwLock<Option<String>>>,
     /// Resume gateway URL.
     resume_gateway_url: Arc<RwLock<Option<String>>>,
+    /// Pending interaction contexts keyed by interaction_id.
+    /// Written by ack_worker, read/removed by send().
+    pending_interactions: Arc<DashMap<String, InteractionContext>>,
 }
 
 impl DiscordAdapter {
@@ -71,8 +141,10 @@ impl DiscordAdapter {
             shutdown_tx: Arc::new(shutdown_tx),
             shutdown_rx,
             bot_user_id: Arc::new(RwLock::new(None)),
+            application_id: Arc::new(RwLock::new(None)),
             session_id: Arc::new(RwLock::new(None)),
             resume_gateway_url: Arc::new(RwLock::new(None)),
+            pending_interactions: Arc::new(DashMap::new()),
         }
     }
 
@@ -82,7 +154,7 @@ impl DiscordAdapter {
         let resp: serde_json::Value = self
             .client
             .get(&url)
-            .header("Authorization", format!("Bot {}", self.token.as_str()))
+            .header("Authorization", bot_auth_header(self.token.as_str()))
             .send()
             .await?
             .json()
@@ -109,7 +181,7 @@ impl DiscordAdapter {
             let resp = self
                 .client
                 .post(&url)
-                .header("Authorization", format!("Bot {}", self.token.as_str()))
+                .header("Authorization", bot_auth_header(self.token.as_str()))
                 .json(&body)
                 .send()
                 .await?;
@@ -128,11 +200,329 @@ impl DiscordAdapter {
         let _ = self
             .client
             .post(&url)
-            .header("Authorization", format!("Bot {}", self.token.as_str()))
+            .header("Authorization", bot_auth_header(self.token.as_str()))
             .send()
             .await?;
         Ok(())
     }
+
+    /// Edit the original deferred interaction response.
+    ///
+    /// Replaces the "Bot is thinking..." message with the actual response.
+    /// `PATCH /webhooks/{app_id}/{token}/messages/@original`
+    async fn edit_interaction_original(
+        &self,
+        app_id: &str,
+        interaction_token: &str,
+        text: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let url = format!(
+            "{DISCORD_API_BASE}/webhooks/{app_id}/{interaction_token}/messages/@original"
+        );
+        let body = serde_json::json!({ "content": text });
+        let resp = self.client.patch(&url).json(&body).send().await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body_text: String = resp
+                .text()
+                .await
+                .unwrap_or_default()
+                .chars()
+                .take(256)
+                .collect();
+            return Err(
+                format!("Discord edit interaction failed ({status}): {body_text}").into(),
+            );
+        }
+        Ok(())
+    }
+
+    /// Send a follow-up message to an interaction (for multi-chunk responses).
+    ///
+    /// `POST /webhooks/{app_id}/{token}`
+    async fn send_interaction_followup(
+        &self,
+        app_id: &str,
+        interaction_token: &str,
+        text: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let url = format!("{DISCORD_API_BASE}/webhooks/{app_id}/{interaction_token}");
+        let body = serde_json::json!({ "content": text });
+        let resp = self.client.post(&url).json(&body).send().await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body_text: String = resp
+                .text()
+                .await
+                .unwrap_or_default()
+                .chars()
+                .take(256)
+                .collect();
+            warn!("Discord interaction follow-up failed ({status}): {body_text}");
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Interaction ACK (standalone — called from spawned tasks)
+// ---------------------------------------------------------------------------
+
+/// Send a deferred acknowledgment for an interaction.
+///
+/// `POST /interactions/{id}/{token}/callback` with `{"type": 5}`
+/// Must be called within 3 seconds of receiving the interaction.
+async fn ack_interaction(
+    client: &reqwest::Client,
+    interaction_id: &str,
+    interaction_token: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let url = format!(
+        "{DISCORD_API_BASE}/interactions/{interaction_id}/{interaction_token}/callback"
+    );
+    let body = serde_json::json!({ "type": 5 });
+    let resp = client.post(&url).json(&body).send().await?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body_text: String = resp
+            .text()
+            .await
+            .unwrap_or_default()
+            .chars()
+            .take(256)
+            .collect();
+        return Err(format!("Discord interaction ACK failed ({status}): {body_text}").into());
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Interaction option parsing
+// ---------------------------------------------------------------------------
+
+/// Extract a Discord option's `value` field as a String regardless of JSON type.
+fn option_value_to_string(opt: &serde_json::Value) -> Option<String> {
+    opt["value"]
+        .as_str()
+        .map(str::to_owned)
+        .or_else(|| opt["value"].as_i64().map(|n| n.to_string()))
+        .or_else(|| opt["value"].as_f64().map(|n| n.to_string()))
+        .or_else(|| opt["value"].as_bool().map(|b| b.to_string()))
+}
+
+/// Flatten a nested Discord interaction options tree into `(command_name, args)`.
+///
+/// For subcommands (type 1), the subcommand name becomes the first arg element
+/// so that `handle_command("schedule", ["add", "agent1", "* * * * *", "hi"])`
+/// matches the existing bridge interface.
+fn flatten_interaction_options(
+    command_name: &str,
+    options: &serde_json::Value,
+) -> (String, Vec<String>) {
+    let Some(opts) = options.as_array() else {
+        return (command_name.to_string(), vec![]);
+    };
+
+    for opt in opts {
+        let t = opt["type"].as_u64().unwrap_or(0);
+        // Subcommand group (type 2) — recurse one level deeper
+        if t == 2 {
+            let sub_name = opt["name"].as_str().unwrap_or(command_name);
+            return flatten_interaction_options(sub_name, &opt["options"]);
+        }
+        // Subcommand (type 1) — its name becomes the first arg
+        if t == 1 {
+            let sub_name = opt["name"].as_str().unwrap_or("");
+            let mut args = vec![sub_name.to_string()];
+            if let Some(sub_opts) = opt["options"].as_array() {
+                args.extend(sub_opts.iter().filter_map(option_value_to_string));
+            }
+            return (command_name.to_string(), args);
+        }
+    }
+
+    // No subcommand — collect top-level option values
+    let args = opts.iter().filter_map(option_value_to_string).collect();
+    (command_name.to_string(), args)
+}
+
+// ---------------------------------------------------------------------------
+// Slash command registration
+// ---------------------------------------------------------------------------
+
+/// Build Discord Application Command definitions from OpenFang's command specs.
+fn build_command_definitions() -> Vec<serde_json::Value> {
+    channel_command_specs()
+        .iter()
+        .map(|spec| {
+            let options = build_options_for_command(spec.name, spec.help);
+            let mut cmd = serde_json::json!({
+                "name": spec.name,
+                "type": 1, // CHAT_INPUT
+                "description": truncate_desc(spec.desc),
+            });
+            if !options.is_empty() {
+                cmd["options"] = serde_json::json!(options);
+            }
+            cmd
+        })
+        .collect()
+}
+
+/// Truncate description to Discord's 100-character limit.
+fn truncate_desc(s: &str) -> String {
+    if s.len() <= 100 {
+        s.to_string()
+    } else {
+        format!("{}...", &s[..97])
+    }
+}
+
+/// Derive Discord command options from the help string pattern.
+///
+/// Matches patterns like:
+///   `/agent <name>`  → required STRING option
+///   `/model [name]`  → optional STRING option
+///   `/think [on|off]` → optional STRING with choices
+///   `/schedule add <agent> <cron> <message> | /schedule del <id>` → subcommands
+fn build_options_for_command(name: &str, help: &str) -> Vec<serde_json::Value> {
+    match name {
+        // --- Subcommand commands ---
+        "workflow" => vec![serde_json::json!({
+            "name": "run",
+            "type": 1, // SUB_COMMAND
+            "description": "Run a workflow",
+            "options": [
+                {"name": "name", "type": 3, "description": "Workflow name", "required": true},
+                {"name": "input", "type": 3, "description": "Input text", "required": false}
+            ]
+        })],
+        "trigger" => vec![
+            serde_json::json!({
+                "name": "add",
+                "type": 1,
+                "description": "Add a new trigger",
+                "options": [
+                    {"name": "agent", "type": 3, "description": "Agent name", "required": true},
+                    {"name": "pattern", "type": 3, "description": "Match pattern", "required": true},
+                    {"name": "prompt", "type": 3, "description": "Prompt text", "required": true}
+                ]
+            }),
+            serde_json::json!({
+                "name": "del",
+                "type": 1,
+                "description": "Delete a trigger",
+                "options": [
+                    {"name": "id", "type": 3, "description": "Trigger ID", "required": true}
+                ]
+            }),
+        ],
+        "schedule" => vec![
+            serde_json::json!({
+                "name": "add",
+                "type": 1,
+                "description": "Add a new schedule",
+                "options": [
+                    {"name": "agent", "type": 3, "description": "Agent name", "required": true},
+                    {"name": "cron", "type": 3, "description": "Cron expression (5 fields)", "required": true},
+                    {"name": "message", "type": 3, "description": "Message to send", "required": true}
+                ]
+            }),
+            serde_json::json!({
+                "name": "del",
+                "type": 1,
+                "description": "Delete a schedule",
+                "options": [
+                    {"name": "id", "type": 3, "description": "Schedule ID", "required": true}
+                ]
+            }),
+            serde_json::json!({
+                "name": "run",
+                "type": 1,
+                "description": "Run a schedule now",
+                "options": [
+                    {"name": "id", "type": 3, "description": "Schedule ID", "required": true}
+                ]
+            }),
+        ],
+
+        // --- Choice-arg commands ---
+        "think" => vec![serde_json::json!({
+            "name": "toggle",
+            "type": 3, // STRING
+            "description": "Enable or disable",
+            "required": false,
+            "choices": [
+                {"name": "on", "value": "on"},
+                {"name": "off", "value": "off"}
+            ]
+        })],
+
+        // --- Single required arg ---
+        "agent" => vec![serde_json::json!({
+            "name": "name", "type": 3, "description": "Agent name", "required": true
+        })],
+        "approve" => vec![serde_json::json!({
+            "name": "id", "type": 3, "description": "Approval request ID", "required": true
+        })],
+        "reject" => vec![serde_json::json!({
+            "name": "id", "type": 3, "description": "Approval request ID", "required": true
+        })],
+
+        // --- Single optional arg ---
+        "model" => vec![serde_json::json!({
+            "name": "name", "type": 3, "description": "Model name", "required": false
+        })],
+
+        // --- No-arg commands (everything else) ---
+        _ => {
+            // Check help string for a trailing argument hint we may have missed
+            if help.contains('<') || help.contains('[') {
+                // Fallback: generic optional string arg
+                vec![serde_json::json!({
+                    "name": "args", "type": 3, "description": "Arguments", "required": false
+                })]
+            } else {
+                vec![]
+            }
+        }
+    }
+}
+
+/// Register all slash commands with Discord (bulk overwrite).
+///
+/// Standalone function because it runs inside `tokio::spawn(async move {...})`.
+async fn register_commands_impl(
+    client: &reqwest::Client,
+    token: &Zeroizing<String>,
+    app_id: &str,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let commands = build_command_definitions();
+    let count = commands.len();
+    let url = format!("{DISCORD_API_BASE}/applications/{app_id}/commands");
+
+    let resp = client
+        .put(&url)
+        .header("Authorization", bot_auth_header(token.as_str()))
+        .json(&commands)
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body: String = resp
+            .text()
+            .await
+            .unwrap_or_default()
+            .chars()
+            .take(512)
+            .collect();
+        return Err(format!("Discord command registration failed ({status}): {body}").into());
+    }
+    Ok(count)
 }
 
 #[async_trait]
@@ -160,9 +550,91 @@ impl ChannelAdapter for DiscordAdapter {
         let allowed_users = self.allowed_users.clone();
         let ignore_bots = self.ignore_bots;
         let bot_user_id = self.bot_user_id.clone();
+        let application_id_store = self.application_id.clone();
         let session_id_store = self.session_id.clone();
         let resume_url_store = self.resume_gateway_url.clone();
         let mut shutdown = self.shutdown_rx.clone();
+
+        // --- ACK worker: decouples interaction ACK from gateway loop ---
+        let (ack_tx, mut ack_rx) = mpsc::channel::<InteractionPayload>(64);
+        let ack_client = self.client.clone();
+        let gateway_client = self.client.clone(); // separate clone for the gateway spawn
+        let ack_pending = self.pending_interactions.clone();
+        // The ack_worker needs its own tx to forward messages to the bridge
+        // after successful ACK. We create a second clone of the bridge tx.
+        let (bridge_tx, bridge_rx) = mpsc::channel::<ChannelMessage>(256);
+
+        tokio::spawn({
+            let mut shutdown_ack = self.shutdown_rx.clone();
+            async move {
+                loop {
+                    tokio::select! {
+                        payload = ack_rx.recv() => {
+                            let Some(payload) = payload else { break };
+
+                            // Enforce hard cap on pending interactions
+                            if ack_pending.len() >= MAX_PENDING_INTERACTIONS {
+                                warn!("Discord: pending interactions at capacity ({MAX_PENDING_INTERACTIONS}), dropping interaction {}", payload.interaction_id);
+                                continue;
+                            }
+
+                            // Send deferred ACK (must complete before bridge processes the command)
+                            if let Err(e) = ack_interaction(
+                                &ack_client,
+                                &payload.interaction_id,
+                                &payload.interaction_token,
+                            ).await {
+                                warn!("Discord: interaction ACK failed for {}: {e}", payload.interaction_id);
+                                continue; // Don't forward to bridge — user sees "interaction failed"
+                            }
+
+                            // Store context so send() can route through webhook
+                            ack_pending.insert(
+                                payload.interaction_id.clone(),
+                                InteractionContext {
+                                    interaction_id: payload.interaction_id,
+                                    interaction_token: payload.interaction_token,
+                                    application_id: payload.application_id,
+                                    channel_id: payload.channel_id,
+                                    created_at: Instant::now(),
+                                },
+                            );
+
+                            // Forward to bridge for command processing
+                            if bridge_tx.send(payload.message).await.is_err() {
+                                break;
+                            }
+                        }
+                        _ = shutdown_ack.changed() => {
+                            if *shutdown_ack.borrow() { break; }
+                        }
+                    }
+                }
+            }
+        });
+
+        // --- TTL cleanup: evict expired interaction contexts ---
+        {
+            let pending_ttl = self.pending_interactions.clone();
+            let mut shutdown_ttl = self.shutdown_rx.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_secs(60)) => {
+                            let before = pending_ttl.len();
+                            pending_ttl.retain(|_, ctx| ctx.created_at.elapsed() < INTERACTION_TTL);
+                            let evicted = before - pending_ttl.len();
+                            if evicted > 0 {
+                                debug!("Discord: evicted {evicted} expired interaction context(s)");
+                            }
+                        }
+                        _ = shutdown_ttl.changed() => {
+                            if *shutdown_ttl.borrow() { break; }
+                        }
+                    }
+                }
+            });
+        }
 
         tokio::spawn(async move {
             let mut backoff = INITIAL_BACKOFF;
@@ -322,17 +794,44 @@ impl ChannelAdapter for DiscordAdapter {
                                         d["user"]["id"].as_str().unwrap_or("").to_string();
                                     let username =
                                         d["user"]["username"].as_str().unwrap_or("unknown");
+                                    let app_id = d["application"]["id"]
+                                        .as_str()
+                                        .unwrap_or("")
+                                        .to_string();
                                     let sid = d["session_id"].as_str().unwrap_or("").to_string();
                                     let resume_url =
                                         d["resume_gateway_url"].as_str().unwrap_or("").to_string();
 
                                     *bot_user_id.write().await = Some(user_id.clone());
+                                    *application_id_store.write().await = Some(app_id.clone());
                                     *session_id_store.write().await = Some(sid);
                                     if !resume_url.is_empty() {
                                         *resume_url_store.write().await = Some(resume_url);
                                     }
 
-                                    info!("Discord bot ready: {username} ({user_id})");
+                                    info!("Discord bot ready: {username} ({user_id}), app_id={app_id}");
+
+                                    // Register slash commands (non-blocking, non-fatal)
+                                    if !app_id.is_empty() {
+                                        let reg_client = gateway_client.clone();
+                                        let reg_token = token.clone();
+                                        tokio::spawn(async move {
+                                            match register_commands_impl(
+                                                &reg_client,
+                                                &reg_token,
+                                                &app_id,
+                                            )
+                                            .await
+                                            {
+                                                Ok(n) => info!(
+                                                    "Discord: registered {n} slash commands"
+                                                ),
+                                                Err(e) => warn!(
+                                                    "Discord: command registration failed (non-fatal): {e}"
+                                                ),
+                                            }
+                                        });
+                                    }
                                 }
 
                                 "MESSAGE_CREATE" | "MESSAGE_UPDATE" => {
@@ -352,6 +851,130 @@ impl ChannelAdapter for DiscordAdapter {
                                         if tx.send(msg).await.is_err() {
                                             return;
                                         }
+                                    }
+                                }
+
+                                "INTERACTION_CREATE" => {
+                                    // Only handle application commands (type 2) for now
+                                    let interaction_type = d["type"].as_u64().unwrap_or(0);
+                                    if interaction_type != 2 {
+                                        debug!("Discord: ignoring interaction type {interaction_type}");
+                                        continue;
+                                    }
+
+                                    let interaction_id =
+                                        d["id"].as_str().unwrap_or("").to_string();
+                                    let interaction_token =
+                                        d["token"].as_str().unwrap_or("").to_string();
+                                    let app_id = d["application_id"]
+                                        .as_str()
+                                        .unwrap_or("")
+                                        .to_string();
+                                    let channel_id =
+                                        d["channel_id"].as_str().unwrap_or("").to_string();
+
+                                    // Validate snowflake IDs before using in URLs
+                                    if !is_valid_snowflake(&interaction_id) {
+                                        warn!("Discord: invalid interaction_id, skipping");
+                                        continue;
+                                    }
+                                    if interaction_token.is_empty() {
+                                        warn!("Discord: empty interaction token, skipping");
+                                        continue;
+                                    }
+
+                                    // Extract user info — guild: member.user, DM: user
+                                    let user_data = d["member"]["user"]
+                                        .as_object()
+                                        .or_else(|| d["user"].as_object());
+                                    let (author_id, username) = match user_data {
+                                        Some(u) => (
+                                            u.get("id")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("")
+                                                .to_string(),
+                                            u.get("username")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("Unknown")
+                                                .to_string(),
+                                        ),
+                                        None => {
+                                            warn!("Discord: no user data in interaction");
+                                            continue;
+                                        }
+                                    };
+
+                                    // Filter by allowed users (if configured)
+                                    if !allowed_users.is_empty()
+                                        && !allowed_users.iter().any(|u| u == &author_id)
+                                    {
+                                        debug!("Discord: ignoring interaction from unlisted user {author_id}");
+                                        continue;
+                                    }
+
+                                    // Filter by allowed guilds (if configured)
+                                    if !allowed_guilds.is_empty() {
+                                        if let Some(guild_id) = d["guild_id"].as_str() {
+                                            if !allowed_guilds.iter().any(|g| g == guild_id) {
+                                                debug!("Discord: ignoring interaction from unlisted guild {guild_id}");
+                                                continue;
+                                            }
+                                        }
+                                    }
+
+                                    // Extract command name and options
+                                    let data = &d["data"];
+                                    let cmd_name =
+                                        data["name"].as_str().unwrap_or("").to_string();
+                                    if cmd_name.is_empty() {
+                                        continue;
+                                    }
+
+                                    let (name, args) = flatten_interaction_options(
+                                        &cmd_name,
+                                        &data["options"],
+                                    );
+
+                                    let is_group = d["guild_id"].as_str().is_some();
+
+                                    let mut metadata = HashMap::new();
+                                    metadata.insert(
+                                        "is_interaction".to_string(),
+                                        serde_json::json!(true),
+                                    );
+                                    metadata.insert(
+                                        "discord_channel_id".to_string(),
+                                        serde_json::json!(channel_id),
+                                    );
+
+                                    let message = ChannelMessage {
+                                        channel: ChannelType::Discord,
+                                        // platform_id = interaction_id so send() routes correctly
+                                        platform_message_id: interaction_id.clone(),
+                                        sender: ChannelUser {
+                                            platform_id: interaction_id.clone(),
+                                            display_name: username,
+                                            openfang_user: None,
+                                        },
+                                        content: ChannelContent::Command { name, args },
+                                        target_agent: None,
+                                        timestamp: Utc::now(),
+                                        is_group,
+                                        thread_id: None,
+                                        metadata,
+                                    };
+
+                                    let payload = InteractionPayload {
+                                        interaction_id: interaction_id.clone(),
+                                        interaction_token,
+                                        application_id: app_id,
+                                        channel_id,
+                                        message,
+                                    };
+
+                                    // Send to ack_worker (non-blocking)
+                                    if ack_tx.try_send(payload).is_err() {
+                                        warn!("Discord: ack_worker channel full, dropping interaction {interaction_id}");
                                     }
                                 }
 
@@ -420,8 +1043,11 @@ impl ChannelAdapter for DiscordAdapter {
             info!("Discord gateway loop stopped");
         });
 
-        let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-        Ok(Box::pin(stream))
+        // Merge streams: regular messages (rx) + interaction commands (bridge_rx)
+        let stream_regular = tokio_stream::wrappers::ReceiverStream::new(rx);
+        let stream_interactions = tokio_stream::wrappers::ReceiverStream::new(bridge_rx);
+        let merged = futures::stream::select(stream_regular, stream_interactions);
+        Ok(Box::pin(merged))
     }
 
     async fn send(
@@ -429,14 +1055,60 @@ impl ChannelAdapter for DiscordAdapter {
         user: &ChannelUser,
         content: ChannelContent,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        // platform_id is the channel_id for Discord
-        let channel_id = &user.platform_id;
+        let key = &user.platform_id;
+
+        // Check if this is a pending interaction response (platform_id == interaction_id)
+        if let Some((_, ctx)) = self.pending_interactions.remove(key) {
+            let text = match content {
+                ChannelContent::Text(t) => t,
+                _ => "(Unsupported content type)".to_string(),
+            };
+            let chunks = split_message(&text, DISCORD_MSG_LIMIT);
+
+            // First chunk: edit the deferred "thinking..." message
+            let fallback_channel = ctx.channel_id.clone();
+            let edit_ok = self
+                .edit_interaction_original(
+                    &ctx.application_id,
+                    &ctx.interaction_token,
+                    chunks[0],
+                )
+                .await
+                .is_ok();
+
+            if !edit_ok {
+                // Fallback: send as regular channel message (token expired, etc.)
+                warn!(
+                    "Discord: interaction edit failed, falling back to channel"
+                );
+                return self.api_send_message(&fallback_channel, &text).await;
+            }
+
+            // Remaining chunks: follow-up messages
+            for chunk in &chunks[1..] {
+                if self
+                    .send_interaction_followup(
+                        &ctx.application_id,
+                        &ctx.interaction_token,
+                        chunk,
+                    )
+                    .await
+                    .is_err()
+                {
+                    warn!("Discord: interaction follow-up failed");
+                    break;
+                }
+            }
+            return Ok(());
+        }
+
+        // Regular message path (platform_id is the channel_id)
         match content {
             ChannelContent::Text(text) => {
-                self.api_send_message(channel_id, &text).await?;
+                self.api_send_message(key, &text).await?;
             }
             _ => {
-                self.api_send_message(channel_id, "(Unsupported content type)")
+                self.api_send_message(key, "(Unsupported content type)")
                     .await?;
             }
         }
@@ -444,6 +1116,10 @@ impl ChannelAdapter for DiscordAdapter {
     }
 
     async fn send_typing(&self, user: &ChannelUser) -> Result<(), Box<dyn std::error::Error>> {
+        // Interaction deferred ACK already shows "Bot is thinking..."
+        if self.pending_interactions.contains_key(&user.platform_id) {
+            return Ok(());
+        }
         self.api_send_typing(&user.platform_id).await
     }
 
@@ -918,5 +1594,151 @@ mod tests {
         );
         assert_eq!(adapter.name(), "discord");
         assert_eq!(adapter.channel_type(), ChannelType::Discord);
+    }
+
+    // --- Slash command / interaction tests ---
+
+    #[test]
+    fn test_is_valid_snowflake() {
+        // Valid snowflakes (17-20 digits)
+        assert!(is_valid_snowflake("12345678901234567")); // 17 digits
+        assert!(is_valid_snowflake("123456789012345678")); // 18
+        assert!(is_valid_snowflake("1234567890123456789")); // 19
+        assert!(is_valid_snowflake("12345678901234567890")); // 20
+
+        // Invalid
+        assert!(!is_valid_snowflake("")); // empty
+        assert!(!is_valid_snowflake("123456789012345")); // too short (15)
+        assert!(!is_valid_snowflake("123456789012345678901")); // too long (21)
+        assert!(!is_valid_snowflake("1234567890123456a")); // non-digit
+        assert!(!is_valid_snowflake("abc12345678901234")); // letters
+    }
+
+    #[test]
+    fn test_interaction_context_debug_redacts_token() {
+        let ctx = InteractionContext {
+            interaction_id: "12345678901234567".to_string(),
+            interaction_token: "super-secret-token-value".to_string(),
+            application_id: "99988877766655544".to_string(),
+            channel_id: "11122233344455566".to_string(),
+            created_at: Instant::now(),
+        };
+        let debug_output = format!("{ctx:?}");
+        assert!(debug_output.contains("[REDACTED]"));
+        assert!(!debug_output.contains("super-secret-token-value"));
+        assert!(debug_output.contains("12345678901234567"));
+    }
+
+    #[test]
+    fn test_option_value_to_string_variants() {
+        // String value
+        let opt = serde_json::json!({"value": "hello"});
+        assert_eq!(option_value_to_string(&opt), Some("hello".to_string()));
+
+        // Integer value
+        let opt = serde_json::json!({"value": 42});
+        assert_eq!(option_value_to_string(&opt), Some("42".to_string()));
+
+        // Float value
+        let opt = serde_json::json!({"value": 3.14});
+        assert_eq!(option_value_to_string(&opt), Some("3.14".to_string()));
+
+        // Boolean value
+        let opt = serde_json::json!({"value": true});
+        assert_eq!(option_value_to_string(&opt), Some("true".to_string()));
+
+        // Null/missing value
+        let opt = serde_json::json!({"name": "foo"});
+        assert_eq!(option_value_to_string(&opt), None);
+    }
+
+    #[test]
+    fn test_flatten_interaction_options_simple() {
+        // No-arg command like /agents
+        let options = serde_json::json!([]);
+        let (name, args) = flatten_interaction_options("agents", &options);
+        assert_eq!(name, "agents");
+        assert!(args.is_empty());
+
+        // Null options
+        let (name, args) = flatten_interaction_options("help", &serde_json::Value::Null);
+        assert_eq!(name, "help");
+        assert!(args.is_empty());
+    }
+
+    #[test]
+    fn test_flatten_interaction_options_with_args() {
+        // Single required arg like /agent <name>
+        let options = serde_json::json!([
+            {"name": "name", "type": 3, "value": "assistant"}
+        ]);
+        let (name, args) = flatten_interaction_options("agent", &options);
+        assert_eq!(name, "agent");
+        assert_eq!(args, vec!["assistant"]);
+    }
+
+    #[test]
+    fn test_flatten_interaction_options_subcommand() {
+        // /schedule add agent1 "* * * * *" "hello"
+        let options = serde_json::json!([{
+            "name": "add",
+            "type": 1,
+            "options": [
+                {"name": "agent", "type": 3, "value": "agent1"},
+                {"name": "cron", "type": 3, "value": "* * * * *"},
+                {"name": "message", "type": 3, "value": "hello"}
+            ]
+        }]);
+        let (name, args) = flatten_interaction_options("schedule", &options);
+        assert_eq!(name, "schedule");
+        assert_eq!(args, vec!["add", "agent1", "* * * * *", "hello"]);
+    }
+
+    #[test]
+    fn test_flatten_interaction_options_integer_value() {
+        let options = serde_json::json!([
+            {"name": "count", "type": 4, "value": 5}
+        ]);
+        let (name, args) = flatten_interaction_options("test", &options);
+        assert_eq!(name, "test");
+        assert_eq!(args, vec!["5"]);
+    }
+
+    #[test]
+    fn test_build_command_definitions_count() {
+        let defs = build_command_definitions();
+        let spec_count = channel_command_specs().len();
+        assert_eq!(defs.len(), spec_count);
+
+        // Every definition must have a name, type, and description
+        for def in &defs {
+            assert!(def["name"].as_str().is_some(), "command missing name");
+            assert_eq!(def["type"].as_u64(), Some(1), "command type must be CHAT_INPUT (1)");
+            assert!(def["description"].as_str().is_some(), "command missing description");
+            // Description must be <= 100 chars
+            let desc = def["description"].as_str().unwrap();
+            assert!(desc.len() <= 100, "description too long for {}: {} chars", def["name"], desc.len());
+        }
+    }
+
+    #[test]
+    fn test_build_command_definitions_subcommands() {
+        let defs = build_command_definitions();
+
+        // Find the "schedule" command — it should have subcommand options
+        let schedule = defs.iter().find(|d| d["name"] == "schedule").unwrap();
+        let opts = schedule["options"].as_array().unwrap();
+        assert!(opts.len() >= 2, "schedule should have subcommand options");
+        // Each option should be type 1 (SUB_COMMAND)
+        for opt in opts {
+            assert_eq!(opt["type"].as_u64(), Some(1));
+        }
+    }
+
+    #[test]
+    fn test_bot_auth_header_is_sensitive() {
+        let header = bot_auth_header("test-token-123");
+        assert!(header.is_sensitive());
+        assert_eq!(header.to_str().unwrap(), "Bot test-token-123");
     }
 }
