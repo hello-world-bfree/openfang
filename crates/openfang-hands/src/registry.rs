@@ -294,6 +294,7 @@ impl HandRegistry {
         skill_content: &str,
     ) -> HandResult<HandDefinition> {
         let def = bundled::parse_bundled("custom", toml_content, skill_content)?;
+        validate_hand_id(&def.id)?;
 
         if self.definitions.contains_key(&def.id) {
             return Err(HandError::AlreadyActive(format!(
@@ -302,7 +303,32 @@ impl HandRegistry {
             )));
         }
 
-        info!(hand = %def.id, name = %def.name, "Installed hand from content");
+        // Persist to disk if hands_dir configured so the template survives
+        // daemon restart. Without this, the POST /api/hands/install path
+        // registers in-memory only and the rescan-on-boot finds nothing.
+        if let Some(hands_dir) = &self.hands_dir {
+            let target_dir = hands_dir.join(&def.id);
+            std::fs::create_dir_all(&target_dir).map_err(|e| {
+                HandError::Config(format!(
+                    "Failed to create hand directory {}: {e}",
+                    target_dir.display()
+                ))
+            })?;
+            std::fs::write(target_dir.join("HAND.toml"), toml_content.as_bytes())
+                .map_err(|e| HandError::Config(format!("Failed to persist HAND.toml: {e}")))?;
+            if !skill_content.is_empty() {
+                std::fs::write(target_dir.join("SKILL.md"), skill_content.as_bytes())
+                    .map_err(|e| HandError::Config(format!("Failed to persist SKILL.md: {e}")))?;
+            }
+            info!(
+                hand = %def.id,
+                name = %def.name,
+                target = %target_dir.display(),
+                "Installed and persisted hand from content"
+            );
+        } else {
+            info!(hand = %def.id, name = %def.name, "Installed hand from content (in-memory only)");
+        }
         self.definitions.insert(def.id.clone(), def.clone());
         Ok(def)
     }

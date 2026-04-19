@@ -5946,14 +5946,28 @@ fn cmd_cron_create(agent: &str, spec: &str, prompt: &str, explicit_name: Option<
             }))
             .send(),
     );
-    // Daemon returns the wrapped shape `{"result": {"id": "..."}}` since
-    // `create_cron_job` wraps via `cron_create`.
-    let id_field = body
+    // Daemon returns one of several wrap shapes depending on internal path:
+    //   {"result": "{\"job_id\":\"...\", \"status\":\"created\"}"}  (stringified)
+    //   {"result": {"id": "..."}}
+    //   {"id": "..."}
+    let id_field: Option<String> = body
         .get("result")
-        .and_then(|r| r.get("id"))
-        .and_then(|v| v.as_str())
-        .or_else(|| body.get("id").and_then(|v| v.as_str()));
-    if let Some(id) = id_field {
+        .and_then(|r| r.as_str())
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+        .and_then(|v| {
+            v.get("job_id")
+                .or_else(|| v.get("id"))
+                .and_then(|x| x.as_str())
+                .map(String::from)
+        })
+        .or_else(|| {
+            body.get("result")
+                .and_then(|r| r.get("id"))
+                .and_then(|v| v.as_str())
+                .map(String::from)
+        })
+        .or_else(|| body.get("id").and_then(|v| v.as_str()).map(String::from));
+    if let Some(id) = id_field.as_ref() {
         ui::success(&format!("Cron job created: {id}"));
         eprintln!(
             "Warning: no delivery configured — failures will be silent. \
