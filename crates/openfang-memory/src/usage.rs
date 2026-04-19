@@ -8,16 +8,27 @@ use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 
 /// A single usage event recording an LLM call.
+///
+/// For Anthropic prompt caching, `input_tokens` reflects only non-cached
+/// tokens as reported by the API; `cache_creation_tokens` and
+/// `cache_read_tokens` are billed at different multipliers (1.25× and 0.10×
+/// respectively). Non-Anthropic providers leave both cache fields at 0.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsageRecord {
     /// Which agent made the call.
     pub agent_id: AgentId,
     /// Model used.
     pub model: String,
-    /// Input tokens consumed.
+    /// Input tokens consumed (non-cached only for providers with caching).
     pub input_tokens: u64,
     /// Output tokens consumed.
     pub output_tokens: u64,
+    /// Tokens written to provider prompt cache on this call.
+    #[serde(default)]
+    pub cache_creation_tokens: u64,
+    /// Tokens read from provider prompt cache on this call.
+    #[serde(default)]
+    pub cache_read_tokens: u64,
     /// Estimated cost in USD.
     pub cost_usd: f64,
     /// Number of tool calls in this interaction.
@@ -88,8 +99,10 @@ impl UsageStore {
         let id = uuid::Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
         conn.execute(
-            "INSERT INTO usage_events (id, agent_id, timestamp, model, input_tokens, output_tokens, cost_usd, tool_calls)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO usage_events \
+             (id, agent_id, timestamp, model, input_tokens, output_tokens, cost_usd, tool_calls, \
+              cache_creation_tokens, cache_read_tokens) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             rusqlite::params![
                 id,
                 record.agent_id.0.to_string(),
@@ -99,6 +112,8 @@ impl UsageStore {
                 record.output_tokens as i64,
                 record.cost_usd,
                 record.tool_calls as i64,
+                record.cache_creation_tokens as i64,
+                record.cache_read_tokens as i64,
             ],
         )
         .map_err(|e| OpenFangError::Memory(e.to_string()))?;
@@ -375,6 +390,8 @@ mod tests {
                 output_tokens: 50,
                 cost_usd: 0.001,
                 tool_calls: 2,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
             })
             .unwrap();
 
@@ -386,6 +403,8 @@ mod tests {
                 output_tokens: 200,
                 cost_usd: 0.01,
                 tool_calls: 1,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
             })
             .unwrap();
 
@@ -411,6 +430,8 @@ mod tests {
                 output_tokens: 50,
                 cost_usd: 0.001,
                 tool_calls: 0,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
             })
             .unwrap();
 
@@ -422,6 +443,8 @@ mod tests {
                 output_tokens: 100,
                 cost_usd: 0.005,
                 tool_calls: 1,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
             })
             .unwrap();
 
@@ -444,6 +467,8 @@ mod tests {
                     output_tokens: 50,
                     cost_usd: 0.001,
                     tool_calls: 0,
+                    cache_creation_tokens: 0,
+                    cache_read_tokens: 0,
                 })
                 .unwrap();
         }
@@ -456,6 +481,8 @@ mod tests {
                 output_tokens: 200,
                 cost_usd: 0.01,
                 tool_calls: 1,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
             })
             .unwrap();
 
@@ -480,6 +507,8 @@ mod tests {
                 output_tokens: 50,
                 cost_usd: 0.05,
                 tool_calls: 0,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
             })
             .unwrap();
 
@@ -500,6 +529,8 @@ mod tests {
                 output_tokens: 50,
                 cost_usd: 0.123,
                 tool_calls: 0,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
             })
             .unwrap();
 
@@ -520,6 +551,8 @@ mod tests {
                 output_tokens: 50,
                 cost_usd: 0.001,
                 tool_calls: 0,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
             })
             .unwrap();
 

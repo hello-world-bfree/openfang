@@ -451,6 +451,9 @@ async fn summarize_messages(
     );
 
     let request = CompletionRequest {
+        // Summarizer requests are short single-turn; caching makes no sense here.
+        cache_system_prompt: false,
+        min_cache_tokens: 0,
         model: model.to_string(),
         messages: vec![Message {
             role: Role::User,
@@ -569,6 +572,8 @@ async fn summarize_in_chunks(
     );
 
     let merge_request = CompletionRequest {
+        cache_system_prompt: false,
+        min_cache_tokens: 0,
         model: model.to_string(),
         messages: vec![Message {
             role: Role::User,
@@ -832,6 +837,7 @@ mod tests {
                     usage: TokenUsage {
                         input_tokens: 100,
                         output_tokens: 50,
+                        ..Default::default()
                     },
                 })
             }
@@ -894,6 +900,7 @@ mod tests {
                     usage: TokenUsage {
                         input_tokens: 100,
                         output_tokens: 50,
+                        ..Default::default()
                     },
                 })
             }
@@ -987,6 +994,7 @@ mod tests {
                     usage: TokenUsage {
                         input_tokens: 500,
                         output_tokens: 100,
+                        ..Default::default()
                     },
                 })
             }
@@ -1183,6 +1191,7 @@ mod tests {
                     usage: TokenUsage {
                         input_tokens: 50,
                         output_tokens: 20,
+                        ..Default::default()
                     },
                 })
             }

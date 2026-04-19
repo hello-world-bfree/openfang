@@ -294,6 +294,42 @@ impl ModelCatalog {
             .map(|m| (m.input_cost_per_m, m.output_cost_per_m))
     }
 
+    /// Minimum cacheable system-prompt token count for a model.
+    ///
+    /// Anthropic publishes per-family minimums: 1024 tokens for Sonnet/Opus,
+    /// 2048 for Haiku. Blocks below the threshold are sent without
+    /// `cache_control`; Anthropic silently ignores cache markers on blocks
+    /// shorter than the minimum, so emitting them would pay the 1.25×
+    /// creation overhead on tokens that never actually cache.
+    ///
+    /// Returns `None` for models that do not support Anthropic-style prompt
+    /// caching (OpenAI, Groq, Gemini, etc.); callers should not attach
+    /// `cache_control` in that case.
+    pub fn min_cache_tokens(&self, model_id: &str) -> Option<u32> {
+        // Resolve through catalog first to normalize aliases.
+        let resolved = self
+            .find_model(model_id)
+            .map(|m| m.id.as_str())
+            .unwrap_or(model_id)
+            .to_lowercase();
+        // Anthropic native + Bedrock + OpenRouter anthropic models.
+        let is_anthropic = resolved.contains("claude")
+            || resolved.contains("anthropic")
+            || self
+                .find_model(model_id)
+                .map(|m| m.provider == "anthropic")
+                .unwrap_or(false);
+        if !is_anthropic {
+            return None;
+        }
+        // Haiku has a higher minimum (2048); Sonnet/Opus use 1024.
+        if resolved.contains("haiku") {
+            Some(2048)
+        } else {
+            Some(1024)
+        }
+    }
+
     /// List all alias mappings.
     pub fn list_aliases(&self) -> &HashMap<String, String> {
         &self.aliases

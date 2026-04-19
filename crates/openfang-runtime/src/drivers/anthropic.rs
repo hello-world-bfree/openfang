@@ -36,12 +36,17 @@ impl AnthropicDriver {
 }
 
 /// Anthropic Messages API request body.
+///
+/// The `system` field is emitted as an array of content blocks (not a bare
+/// string) so that prompt caching can attach `cache_control: {type: "ephemeral"}`
+/// to the stable prefix. Anthropic accepts either shape; the block form is
+/// always used so the caching path has one code site.
 #[derive(Debug, Serialize)]
 struct ApiRequest {
     model: String,
     max_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
-    system: Option<String>,
+    system: Option<Vec<ApiSystemBlock>>,
     messages: Vec<ApiMessage>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<ApiTool>,
@@ -49,6 +54,25 @@ struct ApiRequest {
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     stream: bool,
+}
+
+/// One block in the Anthropic `system` array. The optional `cache_control`
+/// marker enables provider prompt caching for this block.
+#[derive(Debug, Serialize)]
+struct ApiSystemBlock {
+    #[serde(rename = "type")]
+    block_type: &'static str,
+    text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<ApiCacheControl>,
+}
+
+/// Anthropic cache_control marker. Only `ephemeral` (5-min TTL) is emitted;
+/// the `ttl: "1h"` beta is scoped out of v1.
+#[derive(Debug, Serialize)]
+struct ApiCacheControl {
+    #[serde(rename = "type")]
+    cache_type: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -124,10 +148,19 @@ enum ResponseContentBlock {
     Thinking { thinking: String },
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 struct ApiUsage {
+    #[serde(default)]
     input_tokens: u64,
+    #[serde(default)]
     output_tokens: u64,
+    /// Tokens written to prompt cache on this turn (billed at 1.25x input rate).
+    /// Absent on older API responses / non-caching requests.
+    #[serde(default)]
+    cache_creation_input_tokens: u64,
+    /// Tokens read from prompt cache on this turn (billed at 0.1x input rate).
+    #[serde(default)]
+    cache_read_input_tokens: u64,
 }
 
 /// Anthropic API error response.
@@ -152,51 +185,94 @@ enum ContentBlockAccum {
     },
 }
 
+/// Rough character-based token estimator used by the caching gate. The exact
+/// Anthropic tokenizer is not exposed; 4 chars/token is the published rule of
+/// thumb and is good enough for deciding whether to attach `cache_control`.
+fn estimate_tokens(text: &str) -> u32 {
+    (text.len() / 4) as u32
+}
+
+/// Build the wire-level `ApiRequest` from a `CompletionRequest`.
+///
+/// Handles system-prompt extraction (from `request.system` or any `Role::System`
+/// message), wraps it in an `ApiSystemBlock`, and attaches `cache_control:
+/// {type: "ephemeral"}` when the caller requested caching *and* the system
+/// prompt meets the model's minimum cacheable token threshold.
+///
+/// Shared by `complete()` and `stream()` so the caching logic lives in one
+/// place — adding it to only one site and missing the other is a real risk
+/// called out in the plan review (finding L3).
+fn build_api_request(request: &CompletionRequest, stream: bool) -> ApiRequest {
+    // Extract the system prompt from either the explicit field or a Role::System message.
+    let system_text = request.system.clone().or_else(|| {
+        request.messages.iter().find_map(|m| {
+            if m.role == Role::System {
+                match &m.content {
+                    MessageContent::Text(t) => Some(t.clone()),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        })
+    });
+
+    // Decide whether this block qualifies for cache_control.
+    let system = system_text.map(|text| {
+        let tokens = estimate_tokens(&text);
+        let attach_cache = request.cache_system_prompt
+            && request.min_cache_tokens > 0
+            && tokens >= request.min_cache_tokens;
+        if request.cache_system_prompt && !attach_cache {
+            debug!(
+                tokens,
+                threshold = request.min_cache_tokens,
+                "anthropic: system prompt below cache threshold; sending uncached"
+            );
+        }
+        vec![ApiSystemBlock {
+            block_type: "text",
+            text,
+            cache_control: if attach_cache {
+                Some(ApiCacheControl { cache_type: "ephemeral" })
+            } else {
+                None
+            },
+        }]
+    });
+
+    let api_messages: Vec<ApiMessage> = request
+        .messages
+        .iter()
+        .filter(|m| m.role != Role::System)
+        .map(convert_message)
+        .collect();
+
+    let api_tools: Vec<ApiTool> = request
+        .tools
+        .iter()
+        .map(|t| ApiTool {
+            name: t.name.clone(),
+            description: t.description.clone(),
+            input_schema: t.input_schema.clone(),
+        })
+        .collect();
+
+    ApiRequest {
+        model: request.model.clone(),
+        max_tokens: request.max_tokens,
+        system,
+        messages: api_messages,
+        tools: api_tools,
+        temperature: Some(request.temperature),
+        stream,
+    }
+}
+
 #[async_trait]
 impl LlmDriver for AnthropicDriver {
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse, LlmError> {
-        // Extract system prompt from messages or use the provided one
-        let system = request.system.clone().or_else(|| {
-            request.messages.iter().find_map(|m| {
-                if m.role == Role::System {
-                    match &m.content {
-                        MessageContent::Text(t) => Some(t.clone()),
-                        _ => None,
-                    }
-                } else {
-                    None
-                }
-            })
-        });
-
-        // Build API messages, filtering out system messages
-        let api_messages: Vec<ApiMessage> = request
-            .messages
-            .iter()
-            .filter(|m| m.role != Role::System)
-            .map(convert_message)
-            .collect();
-
-        // Build tools
-        let api_tools: Vec<ApiTool> = request
-            .tools
-            .iter()
-            .map(|t| ApiTool {
-                name: t.name.clone(),
-                description: t.description.clone(),
-                input_schema: t.input_schema.clone(),
-            })
-            .collect();
-
-        let api_request = ApiRequest {
-            model: request.model.clone(),
-            max_tokens: request.max_tokens,
-            system,
-            messages: api_messages,
-            tools: api_tools,
-            temperature: Some(request.temperature),
-            stream: false,
-        };
+        let api_request = build_api_request(&request, false);
 
         // Retry loop for rate limits and overloads
         let max_retries = 3;
@@ -264,46 +340,7 @@ impl LlmDriver for AnthropicDriver {
         request: CompletionRequest,
         tx: tokio::sync::mpsc::Sender<StreamEvent>,
     ) -> Result<CompletionResponse, LlmError> {
-        // Build request (same as complete but with stream: true)
-        let system = request.system.clone().or_else(|| {
-            request.messages.iter().find_map(|m| {
-                if m.role == Role::System {
-                    match &m.content {
-                        MessageContent::Text(t) => Some(t.clone()),
-                        _ => None,
-                    }
-                } else {
-                    None
-                }
-            })
-        });
-
-        let api_messages: Vec<ApiMessage> = request
-            .messages
-            .iter()
-            .filter(|m| m.role != Role::System)
-            .map(convert_message)
-            .collect();
-
-        let api_tools: Vec<ApiTool> = request
-            .tools
-            .iter()
-            .map(|t| ApiTool {
-                name: t.name.clone(),
-                description: t.description.clone(),
-                input_schema: t.input_schema.clone(),
-            })
-            .collect();
-
-        let api_request = ApiRequest {
-            model: request.model.clone(),
-            max_tokens: request.max_tokens,
-            system,
-            messages: api_messages,
-            tools: api_tools,
-            temperature: Some(request.temperature),
-            stream: true,
-        };
+        let api_request = build_api_request(&request, true);
 
         // Retry loop for the initial HTTP request
         let max_retries = 3;
@@ -386,8 +423,18 @@ impl LlmDriver for AnthropicDriver {
 
                     match event_type.as_str() {
                         "message_start" => {
-                            if let Some(it) = json["message"]["usage"]["input_tokens"].as_u64() {
+                            // Read input + cache tokens from the initial message_start event.
+                            // Without the cache-field reads, every streaming call reports
+                            // cache_read=0 even on hits and the merge-gate test fails silently.
+                            let u = &json["message"]["usage"];
+                            if let Some(it) = u["input_tokens"].as_u64() {
                                 usage.input_tokens = it;
+                            }
+                            if let Some(c) = u["cache_creation_input_tokens"].as_u64() {
+                                usage.cache_creation_input_tokens = c;
+                            }
+                            if let Some(r) = u["cache_read_input_tokens"].as_u64() {
+                                usage.cache_read_input_tokens = r;
                             }
                         }
                         "content_block_start" => {
@@ -672,6 +719,8 @@ fn convert_response(api: ApiResponse) -> CompletionResponse {
         usage: TokenUsage {
             input_tokens: api.usage.input_tokens,
             output_tokens: api.usage.output_tokens,
+            cache_creation_input_tokens: api.usage.cache_creation_input_tokens,
+            cache_read_input_tokens: api.usage.cache_read_input_tokens,
         },
     }
 }
@@ -704,6 +753,7 @@ mod tests {
             usage: ApiUsage {
                 input_tokens: 100,
                 output_tokens: 50,
+                ..Default::default()
             },
         };
 
@@ -772,4 +822,97 @@ mod tests {
             panic!("Expected Blocks content");
         }
     }
+
+    // ── Prompt caching tests ─────────────────────────────────────────────
+
+    /// Build a minimal CompletionRequest for caching tests.
+    fn cache_test_request(
+        system: &str,
+        cache_system_prompt: bool,
+        min_cache_tokens: u32,
+    ) -> CompletionRequest {
+        CompletionRequest {
+            model: "claude-sonnet-4-6".to_string(),
+            messages: vec![Message::user("hi")],
+            tools: vec![],
+            max_tokens: 100,
+            temperature: 0.7,
+            system: Some(system.to_string()),
+            thinking: None,
+            cache_system_prompt,
+            min_cache_tokens,
+        }
+    }
+
+    #[test]
+    fn caching_disabled_emits_plain_block() {
+        // Long system prompt but cache flag off → no cache_control.
+        let system = "x".repeat(8192); // ~2048 tokens
+        let req = cache_test_request(&system, false, 1024);
+        let api = build_api_request(&req, false);
+        let blocks = api.system.expect("system present");
+        assert_eq!(blocks.len(), 1);
+        assert!(blocks[0].cache_control.is_none());
+    }
+
+    #[test]
+    fn caching_enabled_above_threshold_emits_cache_control() {
+        // ~2048 tokens system prompt + caching on → cache_control attached.
+        let system = "x".repeat(8192);
+        let req = cache_test_request(&system, true, 1024);
+        let api = build_api_request(&req, false);
+        let blocks = api.system.expect("system present");
+        assert_eq!(blocks.len(), 1);
+        let cc = blocks[0].cache_control.as_ref().expect("cache_control present");
+        assert_eq!(cc.cache_type, "ephemeral");
+    }
+
+    #[test]
+    fn caching_enabled_below_threshold_emits_plain_block() {
+        // Short system prompt (well below 1024-token threshold) → no cache_control.
+        let req = cache_test_request("short system", true, 1024);
+        let api = build_api_request(&req, false);
+        let blocks = api.system.expect("system present");
+        assert_eq!(blocks.len(), 1);
+        assert!(
+            blocks[0].cache_control.is_none(),
+            "sub-threshold prompt must not emit cache_control (Anthropic ignores + charges 1.25x)"
+        );
+    }
+
+    #[test]
+    fn caching_with_zero_threshold_disabled() {
+        // min_cache_tokens=0 is the "caching not supported" signal from non-Anthropic
+        // models. Even with cache_system_prompt=true, no cache_control should emit.
+        let system = "x".repeat(8192);
+        let req = cache_test_request(&system, true, 0);
+        let api = build_api_request(&req, false);
+        let blocks = api.system.expect("system present");
+        assert!(blocks[0].cache_control.is_none());
+    }
+
+    #[test]
+    fn api_usage_cache_fields_default_when_absent() {
+        // Legacy API response without cache fields should deserialize as 0.
+        let body = r#"{"input_tokens": 100, "output_tokens": 50}"#;
+        let usage: ApiUsage = serde_json::from_str(body).unwrap();
+        assert_eq!(usage.input_tokens, 100);
+        assert_eq!(usage.output_tokens, 50);
+        assert_eq!(usage.cache_creation_input_tokens, 0);
+        assert_eq!(usage.cache_read_input_tokens, 0);
+    }
+
+    #[test]
+    fn api_usage_cache_fields_parsed_when_present() {
+        let body = r#"{
+            "input_tokens": 10,
+            "output_tokens": 50,
+            "cache_creation_input_tokens": 1800,
+            "cache_read_input_tokens": 0
+        }"#;
+        let usage: ApiUsage = serde_json::from_str(body).unwrap();
+        assert_eq!(usage.cache_creation_input_tokens, 1800);
+        assert_eq!(usage.cache_read_input_tokens, 0);
+    }
+
 }

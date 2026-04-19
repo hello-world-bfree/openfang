@@ -98,10 +98,39 @@ pub struct WorkflowStep {
     /// Optional variable name to store this step's output in.
     #[serde(default)]
     pub output_var: Option<String>,
+    /// Require human approval before dispatching this step.
+    ///
+    /// When true, `execute_run` pauses the workflow, emits an
+    /// `ApprovalRequest`, and waits for the operator to approve or deny via
+    /// `openfang approvals` (or the `/api/approvals` endpoints).
+    #[serde(default)]
+    pub approval_required: bool,
+    /// Optional custom prompt shown to the approver. If absent, a generic
+    /// message naming the step and agent is used.
+    #[serde(default)]
+    pub approval_prompt: Option<String>,
 }
 
 fn default_timeout() -> u64 {
     120
+}
+
+/// Heuristic: does this step name suggest the step pulls external content
+/// (web_fetch, github, curl, etc.)? Used only for the register-time chain
+/// warning; v1.1 will inspect agent capabilities properly.
+fn step_name_implies_fetch(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    ["fetch", "web", "curl", "github", "gh", "http", "researcher", "coder", "clip"]
+        .iter()
+        .any(|needle| n.contains(needle))
+}
+
+/// Heuristic: does this step name suggest the step runs shell commands?
+fn step_name_implies_shell(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    ["shell", "exec", "debug", "run", "build", "test", "deploy"]
+        .iter()
+        .any(|needle| n.contains(needle))
 }
 
 /// How to identify the agent for a step.
@@ -145,11 +174,25 @@ pub enum ErrorMode {
 }
 
 /// The current state of a workflow run.
+///
+/// Existing variants serialize as bare snake_case strings for back-compat
+/// (`"running"`, `"failed"`, etc). The new `WaitingForApproval` variant
+/// carries structured data (step_name + approval_id) and serializes as
+/// `{"waiting_for_approval": {"step_name": "...", "approval_id": "..."}}`.
+/// Old on-disk JSON without the new variant deserializes unchanged.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkflowRunState {
     Pending,
     Running,
+    /// The run is paused, waiting for a human to approve/deny the next step.
+    ///
+    /// `step_name` identifies the gated step; `approval_id` is the id of the
+    /// pending `ApprovalRequest` that must be resolved to resume.
+    WaitingForApproval {
+        step_name: String,
+        approval_id: uuid::Uuid,
+    },
     Completed,
     Failed,
 }
@@ -203,23 +246,75 @@ pub struct WorkflowEngine {
     workflows: Arc<RwLock<HashMap<WorkflowId, Workflow>>>,
     /// Active and completed workflow runs.
     runs: Arc<RwLock<HashMap<WorkflowRunId, WorkflowRun>>>,
+    /// Approval manager used to gate steps with `approval_required = true`.
+    ///
+    /// Optional so existing callers (and tests) continue to work — if
+    /// unset, approval-required steps dispatch without gating and emit
+    /// a warn log. Kernel wires this in at construction.
+    approval_manager: Option<Arc<crate::approval::ApprovalManager>>,
 }
 
 impl WorkflowEngine {
-    /// Create a new workflow engine.
+    /// Create a new workflow engine without approval gating.
+    ///
+    /// Prefer [`with_approval_manager`](Self::with_approval_manager) in
+    /// production paths so steps flagged `approval_required` actually pause.
     pub fn new() -> Self {
         Self {
             workflows: Arc::new(RwLock::new(HashMap::new())),
             runs: Arc::new(RwLock::new(HashMap::new())),
+            approval_manager: None,
+        }
+    }
+
+    /// Create a workflow engine wired to an approval manager.
+    pub fn with_approval_manager(
+        approval_manager: Arc<crate::approval::ApprovalManager>,
+    ) -> Self {
+        Self {
+            workflows: Arc::new(RwLock::new(HashMap::new())),
+            runs: Arc::new(RwLock::new(HashMap::new())),
+            approval_manager: Some(approval_manager),
         }
     }
 
     /// Register a new workflow definition.
+    ///
+    /// Emits a `WARN` at registration if the step sequence contains an
+    /// ungated web_fetch→shell_exec chain (per plan finding H6): a step
+    /// whose `output_var` feeds a shell-exec-capable step without an
+    /// approval gate on the consuming step is the classic prompt-injection
+    /// path. Capability inspection is done by step name heuristic here;
+    /// for a stricter check, pass a capability resolver in v1.1.
     pub async fn register(&self, workflow: Workflow) -> WorkflowId {
         let id = workflow.id;
+        Self::warn_on_ungated_chain(&workflow);
         self.workflows.write().await.insert(id, workflow);
         info!(workflow_id = %id, "Workflow registered");
         id
+    }
+
+    /// Scan a workflow definition for ungated web_fetch → shell_exec chains.
+    fn warn_on_ungated_chain(workflow: &Workflow) {
+        for (i, step) in workflow.steps.iter().enumerate() {
+            if !step_name_implies_fetch(&step.name) {
+                continue;
+            }
+            // Look at the next sequential step. Fan-out/conditional paths
+            // are out of scope for this heuristic (v1.1 capability analysis).
+            if let Some(next) = workflow.steps.get(i + 1) {
+                if step_name_implies_shell(&next.name) && !next.approval_required {
+                    tracing::warn!(
+                        workflow = %workflow.name,
+                        step = %next.name,
+                        "Workflow '{}' has a fetch→shell chain without an approval gate on step '{}'. \
+                         Consider setting approval_required: true on the shell step.",
+                        workflow.name,
+                        next.name
+                    );
+                }
+            }
+        }
     }
 
     /// List all registered workflows.
@@ -346,6 +441,94 @@ impl WorkflowEngine {
             result = result.replace(&format!("{{{{{key}}}}}"), value);
         }
         result
+    }
+
+    /// Pause the run on an approval gate until the operator decides.
+    ///
+    /// Drops any held `runs.write()` guard *before* awaiting the approval
+    /// oneshot so dashboard readers and the approvals endpoint can still read
+    /// run state — plan finding CRIT-2. Transitions the run to
+    /// `WaitingForApproval` under a short write guard, releases it, awaits
+    /// the decision, then returns. On `Approved` → `Ok(())`; on `Denied` or
+    /// `TimedOut` → `Err(reason)`. Without an approval manager configured,
+    /// logs a warn and returns `Ok(())` (gate is a no-op).
+    async fn await_gate(
+        &self,
+        run_id: WorkflowRunId,
+        step: &WorkflowStep,
+        agent_name: &str,
+    ) -> Result<(), String> {
+        use openfang_types::approval::{
+            ApprovalDecision, ApprovalRequest, ApprovalRequestType, RiskLevel,
+        };
+
+        let Some(mgr) = &self.approval_manager else {
+            tracing::warn!(
+                step = %step.name,
+                "approval_required=true but no ApprovalManager configured; gate skipped"
+            );
+            return Ok(());
+        };
+
+        let policy = mgr.policy();
+        let approval_id = uuid::Uuid::new_v4();
+        let description = step
+            .approval_prompt
+            .clone()
+            .unwrap_or_else(|| {
+                format!(
+                    "Workflow step '{}' routed to agent '{}' requires approval before dispatch",
+                    step.name, agent_name
+                )
+            });
+        let req = ApprovalRequest {
+            id: approval_id,
+            agent_id: agent_name.to_string(),
+            tool_name: "workflow_step".to_string(),
+            description: description.chars().take(1024).collect(),
+            action_summary: format!("Step '{}' in workflow run {}", step.name, run_id),
+            risk_level: RiskLevel::High,
+            requested_at: chrono::Utc::now(),
+            timeout_secs: policy.timeout_secs,
+            request_type: ApprovalRequestType::WorkflowStep,
+            workflow_run_id: Some(run_id.0),
+            step_name: Some(step.name.clone()),
+        };
+
+        // Transition to WaitingForApproval under a short-lived write guard,
+        // then release before awaiting the oneshot.
+        {
+            let mut runs = self.runs.write().await;
+            if let Some(r) = runs.get_mut(&run_id) {
+                r.state = WorkflowRunState::WaitingForApproval {
+                    step_name: step.name.clone(),
+                    approval_id,
+                };
+            }
+        }
+
+        let decision = mgr.request_approval(req).await;
+
+        // Re-acquire briefly to transition back to Running on approval.
+        {
+            let mut runs = self.runs.write().await;
+            if let Some(r) = runs.get_mut(&run_id) {
+                r.state = WorkflowRunState::Running;
+            }
+        }
+
+        match decision {
+            ApprovalDecision::Approved => {
+                tracing::info!(
+                    step = %step.name,
+                    approval_id = %approval_id,
+                    "approval granted, resuming workflow"
+                );
+                Ok(())
+            }
+            ApprovalDecision::Denied => Err("rejected by approver".to_string()),
+            ApprovalDecision::TimedOut => Err("approval timed out".to_string()),
+        }
     }
 
     /// Execute a single step with error mode handling. Returns (output, input_tokens, output_tokens).
@@ -483,6 +666,25 @@ impl WorkflowEngine {
                 StepMode::Sequential => {
                     let (agent_id, agent_name) = agent_resolver(&step.agent)
                         .ok_or_else(|| format!("Agent not found for step '{}'", step.name))?;
+
+                    // Approval gate (sync-only v1): if the step declares
+                    // `approval_required`, emit an ApprovalRequest and block
+                    // until the operator decides. No runs-lock is held across
+                    // the await — the helper transitions state under a short
+                    // write guard, then releases it, then awaits the oneshot.
+                    if step.approval_required {
+                        if let Err(e) = self
+                            .await_gate(run_id, step, &agent_name)
+                            .await
+                        {
+                            if let Some(r) = self.runs.write().await.get_mut(&run_id) {
+                                r.state = WorkflowRunState::Failed;
+                                r.error = Some(e.clone());
+                                r.completed_at = Some(Utc::now());
+                            }
+                            return Err(e);
+                        }
+                    }
 
                     let prompt =
                         Self::expand_variables(&step.prompt_template, &current_input, &variables);
@@ -823,6 +1025,8 @@ mod tests {
                     timeout_secs: 30,
                     error_mode: ErrorMode::Fail,
                     output_var: None,
+                    approval_required: false,
+                    approval_prompt: None,
                 },
                 WorkflowStep {
                     name: "summarize".to_string(),
@@ -834,6 +1038,8 @@ mod tests {
                     timeout_secs: 30,
                     error_mode: ErrorMode::Fail,
                     output_var: None,
+                    approval_required: false,
+                    approval_prompt: None,
                 },
             ],
             created_at: Utc::now(),
@@ -935,6 +1141,8 @@ mod tests {
                     timeout_secs: 10,
                     error_mode: ErrorMode::Fail,
                     output_var: None,
+                    approval_required: false,
+                    approval_prompt: None,
                 },
                 WorkflowStep {
                     name: "only-if-error".to_string(),
@@ -948,6 +1156,8 @@ mod tests {
                     timeout_secs: 10,
                     error_mode: ErrorMode::Fail,
                     output_var: None,
+                    approval_required: false,
+                    approval_prompt: None,
                 },
             ],
             created_at: Utc::now(),
@@ -987,6 +1197,8 @@ mod tests {
                     timeout_secs: 10,
                     error_mode: ErrorMode::Fail,
                     output_var: None,
+                    approval_required: false,
+                    approval_prompt: None,
                 },
                 WorkflowStep {
                     name: "only-if-error".to_string(),
@@ -1000,6 +1212,8 @@ mod tests {
                     timeout_secs: 10,
                     error_mode: ErrorMode::Fail,
                     output_var: None,
+                    approval_required: false,
+                    approval_prompt: None,
                 },
             ],
             created_at: Utc::now(),
@@ -1040,6 +1254,8 @@ mod tests {
                 timeout_secs: 10,
                 error_mode: ErrorMode::Fail,
                 output_var: None,
+                approval_required: false,
+                approval_prompt: None,
             }],
             created_at: Utc::now(),
         };
@@ -1086,6 +1302,8 @@ mod tests {
                 timeout_secs: 10,
                 error_mode: ErrorMode::Fail,
                 output_var: None,
+                approval_required: false,
+                approval_prompt: None,
             }],
             created_at: Utc::now(),
         };
@@ -1121,6 +1339,8 @@ mod tests {
                     timeout_secs: 10,
                     error_mode: ErrorMode::Skip,
                     output_var: None,
+                    approval_required: false,
+                    approval_prompt: None,
                 },
                 WorkflowStep {
                     name: "succeeds".to_string(),
@@ -1132,6 +1352,8 @@ mod tests {
                     timeout_secs: 10,
                     error_mode: ErrorMode::Fail,
                     output_var: None,
+                    approval_required: false,
+                    approval_prompt: None,
                 },
             ],
             created_at: Utc::now(),
@@ -1179,6 +1401,8 @@ mod tests {
                 timeout_secs: 10,
                 error_mode: ErrorMode::Retry { max_retries: 2 },
                 output_var: None,
+                approval_required: false,
+                approval_prompt: None,
             }],
             created_at: Utc::now(),
         };
@@ -1223,6 +1447,8 @@ mod tests {
                     timeout_secs: 10,
                     error_mode: ErrorMode::Fail,
                     output_var: Some("first_result".to_string()),
+                    approval_required: false,
+                    approval_prompt: None,
                 },
                 WorkflowStep {
                     name: "transform".to_string(),
@@ -1234,6 +1460,8 @@ mod tests {
                     timeout_secs: 10,
                     error_mode: ErrorMode::Fail,
                     output_var: Some("second_result".to_string()),
+                    approval_required: false,
+                    approval_prompt: None,
                 },
                 WorkflowStep {
                     name: "combine".to_string(),
@@ -1246,6 +1474,8 @@ mod tests {
                     timeout_secs: 10,
                     error_mode: ErrorMode::Fail,
                     output_var: None,
+                    approval_required: false,
+                    approval_prompt: None,
                 },
             ],
             created_at: Utc::now(),
@@ -1293,6 +1523,8 @@ mod tests {
                     timeout_secs: 10,
                     error_mode: ErrorMode::Fail,
                     output_var: None,
+                    approval_required: false,
+                    approval_prompt: None,
                 },
                 WorkflowStep {
                     name: "task-b".to_string(),
@@ -1304,6 +1536,8 @@ mod tests {
                     timeout_secs: 10,
                     error_mode: ErrorMode::Fail,
                     output_var: None,
+                    approval_required: false,
+                    approval_prompt: None,
                 },
                 WorkflowStep {
                     name: "collect".to_string(),
@@ -1315,6 +1549,8 @@ mod tests {
                     timeout_secs: 10,
                     error_mode: ErrorMode::Fail,
                     output_var: None,
+                    approval_required: false,
+                    approval_prompt: None,
                 },
             ],
             created_at: Utc::now(),

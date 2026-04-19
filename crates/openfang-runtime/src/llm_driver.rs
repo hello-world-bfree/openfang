@@ -65,6 +65,23 @@ pub struct CompletionRequest {
     pub system: Option<String>,
     /// Extended thinking configuration (if supported by the model).
     pub thinking: Option<openfang_types::config::ThinkingConfig>,
+    /// Request provider prompt caching on the system-prompt block.
+    ///
+    /// Currently only honored by the Anthropic driver. Non-Anthropic drivers
+    /// ignore it (they may log a DEBUG diagnostic). Combined with the
+    /// `min_cache_tokens` threshold, the Anthropic driver decides whether to
+    /// attach `cache_control: {type: "ephemeral"}` to the system block.
+    pub cache_system_prompt: bool,
+    /// Minimum cacheable system-prompt token count for the target model.
+    ///
+    /// Looked up from the model catalog (1024 Sonnet/Opus, 2048 Haiku).
+    /// The Anthropic driver only emits `cache_control` when the estimated
+    /// system-prompt token count is at least this threshold — otherwise
+    /// Anthropic silently ignores the marker and the caller pays the 1.25×
+    /// creation overhead for zero benefit.
+    ///
+    /// `0` disables the threshold check (not recommended in production).
+    pub min_cache_tokens: u32,
 }
 
 /// A response from an LLM completion.
@@ -262,6 +279,7 @@ mod tests {
                 usage: TokenUsage {
                     input_tokens: 10,
                     output_tokens: 5,
+                    ..Default::default()
                 },
             },
         ];
@@ -290,6 +308,7 @@ mod tests {
                     usage: TokenUsage {
                         input_tokens: 5,
                         output_tokens: 3,
+                        ..Default::default()
                     },
                 })
             }
@@ -305,6 +324,8 @@ mod tests {
             temperature: 0.0,
             system: None,
             thinking: None,
+            cache_system_prompt: false,
+            min_cache_tokens: 0,
         };
 
         let response = driver.stream(request, tx).await.unwrap();

@@ -121,6 +121,23 @@ pub fn strip_provider_prefix(model: &str, provider: &str) -> String {
 /// Default context window size (tokens) for token-based trimming.
 const DEFAULT_CONTEXT_WINDOW: usize = 200_000;
 
+/// Minimum cacheable system-prompt token count for the given model id.
+///
+/// Anthropic publishes per-family minimums: 1024 for Sonnet/Opus, 2048 for
+/// Haiku. Non-Anthropic models return 0 (caching disabled). Matches the
+/// logic in `openfang-runtime::model_catalog::ModelCatalog::min_cache_tokens`
+/// but is inlined here to avoid constructing a full catalog on every agent
+/// turn (hot path). If this duplication ever drifts, the catalog method is
+/// authoritative.
+fn min_cache_tokens_for(model_id: &str) -> u32 {
+    let lower = model_id.to_lowercase();
+    let is_anthropic = lower.contains("claude") || lower.contains("anthropic");
+    if !is_anthropic {
+        return 0;
+    }
+    if lower.contains("haiku") { 2048 } else { 1024 }
+}
+
 /// Agent lifecycle phase within the execution loop.
 /// Used for UX indicators (typing, reactions) without coupling to channel types.
 #[derive(Debug, Clone, PartialEq)]
@@ -397,6 +414,8 @@ pub async fn run_agent_loop(
             temperature: manifest.model.temperature,
             system: Some(system_prompt.clone()),
             thinking: None,
+            cache_system_prompt: manifest.model.cache_system_prompt,
+            min_cache_tokens: min_cache_tokens_for(&manifest.model.model),
         };
 
         // Notify phase: Thinking
@@ -1577,6 +1596,8 @@ pub async fn run_agent_loop_streaming(
             temperature: manifest.model.temperature,
             system: Some(system_prompt.clone()),
             thinking: None,
+            cache_system_prompt: manifest.model.cache_system_prompt,
+            min_cache_tokens: min_cache_tokens_for(&manifest.model.model),
         };
 
         // Notify phase: on first iteration emit Streaming; on subsequent
@@ -3075,6 +3096,7 @@ mod tests {
                     usage: TokenUsage {
                         input_tokens: 10,
                         output_tokens: 5,
+                        ..Default::default()
                     },
                 })
             } else {
@@ -3086,6 +3108,7 @@ mod tests {
                     usage: TokenUsage {
                         input_tokens: 10,
                         output_tokens: 0,
+                        ..Default::default()
                     },
                 })
             }
@@ -3109,6 +3132,7 @@ mod tests {
                 usage: TokenUsage {
                     input_tokens: 10,
                     output_tokens: 0,
+                    ..Default::default()
                 },
             })
         }
@@ -3133,6 +3157,7 @@ mod tests {
                 usage: TokenUsage {
                     input_tokens: 10,
                     output_tokens: 8,
+                    ..Default::default()
                 },
             })
         }
@@ -3427,6 +3452,7 @@ mod tests {
                     usage: TokenUsage {
                         input_tokens: 10,
                         output_tokens: 0,
+                        ..Default::default()
                     },
                 })
             } else {
@@ -3441,6 +3467,7 @@ mod tests {
                     usage: TokenUsage {
                         input_tokens: 15,
                         output_tokens: 8,
+                        ..Default::default()
                     },
                 })
             }
@@ -3464,6 +3491,7 @@ mod tests {
                 usage: TokenUsage {
                     input_tokens: 10,
                     output_tokens: 0,
+                    ..Default::default()
                 },
             })
         }
@@ -4424,6 +4452,7 @@ mod tests {
                     usage: TokenUsage {
                         input_tokens: 20,
                         output_tokens: 15,
+                        ..Default::default()
                     },
                 })
             } else {
@@ -4438,6 +4467,7 @@ mod tests {
                     usage: TokenUsage {
                         input_tokens: 30,
                         output_tokens: 12,
+                        ..Default::default()
                     },
                 })
             }

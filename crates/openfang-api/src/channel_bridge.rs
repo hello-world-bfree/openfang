@@ -523,6 +523,8 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
                         timeout_secs: None,
                     },
                     delivery: openfang_types::scheduler::CronDelivery::None,
+                    overlap_policy: openfang_types::scheduler::OverlapPolicy::default(),
+                    max_in_flight: 1,
                     created_at: chrono::Utc::now(),
                     last_run: None,
                     next_run: None,

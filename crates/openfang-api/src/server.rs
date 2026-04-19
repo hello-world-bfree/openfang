@@ -592,6 +592,10 @@ pub async fn build_router(
             axum::routing::patch(routes::set_cron_delivery),
         )
         .route(
+            "/api/cron/jobs/{id}/overlap-policy",
+            axum::routing::patch(routes::set_cron_overlap_policy),
+        )
+        .route(
             "/api/cron/jobs/{id}/status",
             axum::routing::get(routes::cron_job_status),
         )

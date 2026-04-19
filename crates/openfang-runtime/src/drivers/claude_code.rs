@@ -429,6 +429,7 @@ impl LlmDriver for ClaudeCodeDriver {
                 usage: TokenUsage {
                     input_tokens: usage.input_tokens,
                     output_tokens: usage.output_tokens,
+                    ..Default::default()
                 },
             });
         }
@@ -442,10 +443,7 @@ impl LlmDriver for ClaudeCodeDriver {
             }],
             stop_reason: StopReason::EndTurn,
             tool_calls: Vec::new(),
-            usage: TokenUsage {
-                input_tokens: 0,
-                output_tokens: 0,
-            },
+            usage: TokenUsage::default(),
         })
     }
 
@@ -512,10 +510,7 @@ impl LlmDriver for ClaudeCodeDriver {
         let mut lines = reader.lines();
 
         let mut full_text = String::new();
-        let mut final_usage = TokenUsage {
-            input_tokens: 0,
-            output_tokens: 0,
-        };
+        let mut final_usage = TokenUsage::default();
 
         let timeout_duration = std::time::Duration::from_secs(self.message_timeout_secs);
         let stream_result = tokio::time::timeout(timeout_duration, async {
@@ -567,6 +562,7 @@ impl LlmDriver for ClaudeCodeDriver {
                                     final_usage = TokenUsage {
                                         input_tokens: usage.input_tokens,
                                         output_tokens: usage.output_tokens,
+                                        ..Default::default()
                                     };
                                 }
                             }
@@ -717,6 +713,8 @@ mod tests {
             temperature: 0.7,
             system: Some("You are helpful.".to_string()),
             thinking: None,
+            cache_system_prompt: false,
+            min_cache_tokens: 0,
         };
 
         let prompt = ClaudeCodeDriver::build_prompt(&request);

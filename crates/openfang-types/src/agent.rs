@@ -386,6 +386,12 @@ pub struct ModelConfig {
     pub api_key_env: Option<String>,
     /// Optional base URL override for the provider.
     pub base_url: Option<String>,
+    /// Enable provider prompt caching on the system prompt block.
+    ///
+    /// Currently only honored by the Anthropic driver; non-Anthropic drivers
+    /// ignore it silently. Opt-in (default `false`) for v1 — flip the default
+    /// in a follow-up release after cost telemetry confirms the win.
+    pub cache_system_prompt: bool,
 }
 
 impl Default for ModelConfig {
@@ -398,6 +404,7 @@ impl Default for ModelConfig {
             system_prompt: "You are a helpful AI agent.".to_string(),
             api_key_env: None,
             base_url: None,
+            cache_system_prompt: false,
         }
     }
 }
@@ -411,6 +418,10 @@ pub struct FallbackModel {
     pub api_key_env: Option<String>,
     #[serde(default)]
     pub base_url: Option<String>,
+    /// Enable provider prompt caching when this fallback is active.
+    /// Defaults to `false`; see [`ModelConfig::cache_system_prompt`].
+    #[serde(default)]
+    pub cache_system_prompt: bool,
 }
 
 /// Tool configuration within an agent manifest.
@@ -971,6 +982,7 @@ mod tests {
             model: "llama-3.3-70b".to_string(),
             api_key_env: Some("GROQ_API_KEY".to_string()),
             base_url: None,
+            cache_system_prompt: false,
         };
         let json = serde_json::to_string(&fb).unwrap();
         let back: FallbackModel = serde_json::from_str(&json).unwrap();
@@ -988,6 +1000,7 @@ mod tests {
                 model: "llama-3.3-70b".to_string(),
                 api_key_env: None,
                 base_url: None,
+                cache_system_prompt: false,
             }],
             ..Default::default()
         };

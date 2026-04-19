@@ -200,10 +200,35 @@ impl MeteringEngine {
         input_tokens: u64,
         output_tokens: u64,
     ) -> f64 {
+        Self::estimate_cost_with_cache(catalog, model, input_tokens, output_tokens, 0, 0)
+    }
+
+    /// Estimate cost including Anthropic prompt-cache multipliers.
+    ///
+    /// Anthropic bills `cache_creation_input_tokens` at 1.25× the input rate
+    /// and `cache_read_input_tokens` at 0.10× the input rate. Non-Anthropic
+    /// providers pass 0 for both cache fields, falling back to legacy math.
+    ///
+    /// `input_tokens` reflects only non-cached input tokens (this is what the
+    /// Anthropic API already returns in the `input_tokens` field when caching
+    /// is active).
+    pub fn estimate_cost_with_cache(
+        catalog: &openfang_runtime::model_catalog::ModelCatalog,
+        model: &str,
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_creation_tokens: u64,
+        cache_read_tokens: u64,
+    ) -> f64 {
         let (input_per_m, output_per_m) = catalog.pricing(model).unwrap_or((1.0, 3.0));
         let input_cost = (input_tokens as f64 / 1_000_000.0) * input_per_m;
         let output_cost = (output_tokens as f64 / 1_000_000.0) * output_per_m;
-        input_cost + output_cost
+        // Cache creation: 1.25× input rate. Cache read: 0.10× input rate.
+        let cache_create_cost =
+            (cache_creation_tokens as f64 / 1_000_000.0) * input_per_m * 1.25;
+        let cache_read_cost =
+            (cache_read_tokens as f64 / 1_000_000.0) * input_per_m * 0.10;
+        input_cost + output_cost + cache_create_cost + cache_read_cost
     }
 
     /// Clean up old usage records.
@@ -539,6 +564,8 @@ mod tests {
                 output_tokens: 50,
                 cost_usd: 0.001,
                 tool_calls: 0,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
             })
             .unwrap();
 
@@ -562,6 +589,8 @@ mod tests {
                 output_tokens: 5000,
                 cost_usd: 0.05,
                 tool_calls: 0,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
             })
             .unwrap();
 
@@ -589,6 +618,8 @@ mod tests {
                 output_tokens: 50000,
                 cost_usd: 100.0,
                 tool_calls: 0,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
             })
             .unwrap();
 
@@ -787,6 +818,52 @@ mod tests {
     }
 
     #[test]
+    fn test_estimate_cost_with_cache_anthropic_multipliers() {
+        // Sonnet input $3/M, output $15/M. Cache creation = 1.25x input,
+        // cache read = 0.10x input. For 1k input + 1k output + 10k cache_create
+        // + 100k cache_read:
+        //   input:        1_000 / 1_000_000 * 3.0     = 0.003
+        //   output:       1_000 / 1_000_000 * 15.0    = 0.015
+        //   cache_create: 10_000 / 1_000_000 * 3.0 * 1.25 = 0.0375
+        //   cache_read:  100_000 / 1_000_000 * 3.0 * 0.10 = 0.030
+        //   total                                        = 0.0855
+        let catalog = openfang_runtime::model_catalog::ModelCatalog::default();
+        let cost = MeteringEngine::estimate_cost_with_cache(
+            &catalog,
+            "claude-sonnet-4-6",
+            1_000,
+            1_000,
+            10_000,
+            100_000,
+        );
+        assert!(
+            (cost - 0.0855).abs() < 0.0001,
+            "expected ~0.0855, got {cost}"
+        );
+    }
+
+    #[test]
+    fn test_estimate_cost_with_cache_zero_cache_matches_legacy() {
+        // With both cache fields 0, cost must equal estimate_cost_with_catalog.
+        let catalog = openfang_runtime::model_catalog::ModelCatalog::default();
+        let legacy = MeteringEngine::estimate_cost_with_catalog(
+            &catalog,
+            "claude-sonnet-4-6",
+            5_000,
+            2_000,
+        );
+        let cached = MeteringEngine::estimate_cost_with_cache(
+            &catalog,
+            "claude-sonnet-4-6",
+            5_000,
+            2_000,
+            0,
+            0,
+        );
+        assert!((legacy - cached).abs() < 1e-9);
+    }
+
+    #[test]
     fn test_get_summary() {
         let engine = setup();
         let agent_id = AgentId::new();
@@ -799,6 +876,8 @@ mod tests {
                 output_tokens: 200,
                 cost_usd: 0.005,
                 tool_calls: 3,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
             })
             .unwrap();
 

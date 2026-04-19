@@ -26,7 +26,14 @@ const MAX_ACTION_SUMMARY_LEN: usize = 512;
 const MIN_TIMEOUT_SECS: u64 = 10;
 
 /// Maximum approval timeout in seconds.
-const MAX_TIMEOUT_SECS: u64 = 300;
+///
+/// Raised from 300s to 3600s to accommodate workflow-step approvals, which
+/// are designed to be reviewed from a second terminal or after reviewing
+/// prior-step output — not instant-in-the-flow like tool-call approvals.
+/// Per-request validation enforces this cap; the policy default stays at 60s.
+/// Workflow-step gates are attended — run the daemon under a process manager
+/// if you need windows longer than an hour (persistence is a v1.1 ticket).
+const MAX_TIMEOUT_SECS: u64 = 3600;
 
 // ---------------------------------------------------------------------------
 // RiskLevel
@@ -67,6 +74,22 @@ pub enum ApprovalDecision {
     TimedOut,
 }
 
+/// Originating source of an approval request.
+///
+/// Disambiguates per-tool approvals (legacy) from workflow-step gates so that
+/// `openfang approvals list` output is interpretable and `resolve()` can
+/// optionally reject type-mismatched UUID references. Defaults to `ToolUse`
+/// for on-disk back-compat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalRequestType {
+    /// A tool invocation (e.g. shell_exec) asked for approval.
+    #[default]
+    ToolUse,
+    /// A workflow step asked for approval before it dispatches.
+    WorkflowStep,
+}
+
 // ---------------------------------------------------------------------------
 // ApprovalRequest
 // ---------------------------------------------------------------------------
@@ -84,6 +107,18 @@ pub struct ApprovalRequest {
     pub requested_at: DateTime<Utc>,
     /// Auto-deny timeout in seconds.
     pub timeout_secs: u64,
+    /// Originating source of this request. Defaults to `ToolUse` for
+    /// on-disk back-compat; workflow-step gates set this explicitly to
+    /// `WorkflowStep`.
+    #[serde(default)]
+    pub request_type: ApprovalRequestType,
+    /// Workflow run this request belongs to, if any. Populated only for
+    /// `request_type = WorkflowStep`.
+    #[serde(default)]
+    pub workflow_run_id: Option<Uuid>,
+    /// Workflow step name, if this request originates from a workflow step.
+    #[serde(default)]
+    pub step_name: Option<String>,
 }
 
 impl ApprovalRequest {
@@ -299,6 +334,9 @@ mod tests {
             risk_level: RiskLevel::High,
             requested_at: Utc::now(),
             timeout_secs: 60,
+            request_type: ApprovalRequestType::ToolUse,
+            workflow_run_id: None,
+            step_name: None,
         }
     }
 
@@ -476,7 +514,7 @@ mod tests {
     #[test]
     fn request_timeout_too_large() {
         let mut req = valid_request();
-        req.timeout_secs = 301;
+        req.timeout_secs = 3601;
         let err = req.validate().unwrap_err();
         assert!(err.contains("too large"), "{err}");
     }
@@ -490,6 +528,15 @@ mod tests {
 
     #[test]
     fn request_timeout_max_boundary_ok() {
+        let mut req = valid_request();
+        req.timeout_secs = 3600;
+        assert!(req.validate().is_ok());
+    }
+
+    #[test]
+    fn request_timeout_legacy_300s_still_valid() {
+        // Workflow-approval timeout cap raised to 3600; old tool-call clients
+        // still work.
         let mut req = valid_request();
         req.timeout_secs = 300;
         assert!(req.validate().is_ok());
@@ -590,7 +637,7 @@ mod tests {
     #[test]
     fn policy_timeout_too_large() {
         let mut policy = valid_policy();
-        policy.timeout_secs = 301;
+        policy.timeout_secs = 3601;
         let err = policy.validate().unwrap_err();
         assert!(err.contains("too large"), "{err}");
     }
@@ -600,7 +647,7 @@ mod tests {
         let mut policy = valid_policy();
         policy.timeout_secs = 10;
         assert!(policy.validate().is_ok());
-        policy.timeout_secs = 300;
+        policy.timeout_secs = 3600;
         assert!(policy.validate().is_ok());
     }
 

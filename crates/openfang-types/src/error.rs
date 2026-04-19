@@ -98,6 +98,14 @@ pub enum OpenFangError {
     /// Invalid user input.
     #[error("Invalid input: {0}")]
     InvalidInput(String),
+
+    /// A feature exists in the schema but its implementation is stubbed out.
+    ///
+    /// Used for scope-out paths (e.g. `overlap_policy=queue`) that should be
+    /// visible to users without being misread as bugs. Surfaces as HTTP 501
+    /// at the API boundary.
+    #[error("Not implemented: {0}")]
+    NotImplemented(&'static str),
 }
 
 /// Alias for Result with OpenFangError.

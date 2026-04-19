@@ -693,6 +693,16 @@ enum CronCommands {
         #[command(subcommand)]
         kind: CronDeliveryKind,
     },
+    /// Configure what happens when a fire arrives while a prior run is
+    /// still in-flight.
+    SetOverlapPolicy {
+        /// Job ID.
+        id: String,
+        /// One of `skip` (default), `allow`. `queue` and `kill-and-run`
+        /// are stubbed — setting them returns NotImplemented at dispatch.
+        #[arg(value_parser = ["skip", "allow", "queue", "kill-and-run"])]
+        policy: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1095,6 +1105,9 @@ fn main() {
             CronCommands::Trigger { id } => cmd_cron_trigger(&id),
             CronCommands::SetDelivery { id, kind } => {
                 cmd_cron_set_delivery(&id, delivery_kind_to_json(kind))
+            }
+            CronCommands::SetOverlapPolicy { id, policy } => {
+                cmd_cron_set_overlap_policy(&id, &policy)
             }
         },
         Some(Commands::Sessions { agent, json }) => cmd_sessions(agent.as_deref(), json),
@@ -3228,6 +3241,27 @@ fn cmd_workflow_create(file: PathBuf) {
 fn cmd_workflow_run(workflow_id: &str, input: &str) {
     let base = require_daemon("workflow run");
     let client = daemon_client();
+
+    // Fetch the workflow definition first and advise if it has approval gates.
+    // The run may block waiting for approval; users typing `openfang workflow
+    // run` shouldn't have to guess why the CLI is hanging.
+    if let Ok(def_body) = serde_json::from_value::<serde_json::Value>(daemon_json(
+        client
+            .get(format!("{base}/api/workflows/{workflow_id}"))
+            .send(),
+    )) {
+        let has_gate = def_body["steps"]
+            .as_array()
+            .map(|s| s.iter().any(|st| st["approval_required"].as_bool().unwrap_or(false)))
+            .unwrap_or(false);
+        if has_gate {
+            eprintln!(
+                "Note: this workflow has approval gates — execution will pause for human approval. \
+                 In another shell, run 'openfang workflow runs' or 'openfang approvals list' to resolve gates."
+            );
+        }
+    }
+
     let body = daemon_json(
         client
             .post(format!("{base}/api/workflows/{workflow_id}/run"))
@@ -5797,10 +5831,10 @@ fn cmd_cron_list(json: bool) {
         return;
     }
     println!(
-        "{:<12} {:<18} {:<20} {:<8} {:<24} NAME",
-        "ID", "AGENT", "SCHEDULE", "ENABLED", "DELIVERY"
+        "{:<12} {:<18} {:<20} {:<8} {:<8} {:<8} {:<24} NAME",
+        "ID", "AGENT", "SCHEDULE", "ENABLED", "OVERLAP", "SKIPPED", "DELIVERY"
     );
-    println!("{}", "-".repeat(110));
+    println!("{}", "-".repeat(130));
     for j in jobs {
         let id_short: String = j["id"].as_str().unwrap_or("?").chars().take(8).collect();
         let agent_short: String = j["agent_id"]
@@ -5811,8 +5845,10 @@ fn cmd_cron_list(json: bool) {
             .collect();
         let schedule = render_schedule(&j["schedule"]);
         let delivery = render_delivery(&j["delivery"]);
+        let overlap = j["overlap_policy"]["kind"].as_str().unwrap_or("skip");
+        let skipped = j["skip_count"].as_u64().unwrap_or(0);
         println!(
-            "{:<12} {:<18} {:<20} {:<8} {:<24} {}",
+            "{:<12} {:<18} {:<20} {:<8} {:<8} {:<8} {:<24} {}",
             id_short,
             agent_short,
             schedule,
@@ -5821,6 +5857,8 @@ fn cmd_cron_list(json: bool) {
             } else {
                 "no"
             },
+            overlap,
+            skipped,
             delivery,
             j["name"].as_str().unwrap_or(""),
         );
@@ -6007,6 +6045,34 @@ fn cmd_cron_trigger(id: &str) {
         ui::error(&format!("Failed: {err}"));
     } else {
         ui::success(&format!("Cron job {id} triggered."));
+    }
+}
+
+fn cmd_cron_set_overlap_policy(id: &str, policy: &str) {
+    if matches!(policy, "queue" | "kill-and-run") {
+        eprintln!(
+            "Warning: overlap_policy '{policy}' is not yet implemented. \
+             The field will be recorded but dispatch will return NotImplemented. \
+             Use 'skip' or 'allow' for now."
+        );
+    }
+    let base = require_daemon("cron set-overlap-policy");
+    let client = daemon_client();
+    // Map CLI spelling → enum spelling (`kill-and-run` → `kill_and_run`).
+    let kind = match policy {
+        "kill-and-run" => "kill_and_run",
+        other => other,
+    };
+    let body = daemon_json(
+        client
+            .patch(format!("{base}/api/cron/jobs/{id}/overlap-policy"))
+            .json(&serde_json::json!({ "kind": kind }))
+            .send(),
+    );
+    if let Some(err) = body.get("error").and_then(|v| v.as_str()) {
+        ui::error(&format!("Failed: {err}"));
+    } else {
+        ui::success(&format!("Cron job {id} overlap policy set to {policy}."));
     }
 }
 

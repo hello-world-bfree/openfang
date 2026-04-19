@@ -11,10 +11,13 @@ use chrono::{Duration, Utc};
 use dashmap::DashMap;
 use openfang_types::agent::AgentId;
 use openfang_types::error::{OpenFangError, OpenFangResult};
-use openfang_types::scheduler::{CronDelivery, CronJob, CronJobId, CronSchedule};
+use openfang_types::scheduler::{
+    CronDelivery, CronJob, CronJobId, CronSchedule, OverlapPolicy,
+};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 /// Maximum consecutive errors before a job is auto-disabled.
@@ -38,6 +41,14 @@ pub enum ClaimError {
 /// The `CronJob` struct in `openfang-types` is intentionally lean (no
 /// `one_shot`, `last_status`, or error tracking). The scheduler tracks
 /// these operational details separately.
+///
+/// `in_flight` and `skip_count` are `Arc<AtomicU32>` because `JobMeta`
+/// is cloned out of the `DashMap` in several read paths (`get_meta`,
+/// `list_all_jobs`); without the Arc, each clone would get a fresh
+/// atomic and reads would always show 0. Both are `#[serde(skip)]` —
+/// cron work is always in-process tokio tasks that do not survive
+/// daemon restart, so resetting to 0 on boot is correct. Revisit
+/// this invariant if subprocess/cross-host cron is ever introduced.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobMeta {
     /// The underlying job definition.
@@ -48,6 +59,16 @@ pub struct JobMeta {
     pub last_status: Option<String>,
     /// Number of consecutive failed executions.
     pub consecutive_errors: u32,
+    /// Current in-flight count for `overlap_policy` enforcement.
+    #[serde(skip, default = "zero_atomic")]
+    pub in_flight: Arc<AtomicU32>,
+    /// Number of fires skipped due to overlap since daemon boot.
+    #[serde(skip, default = "zero_atomic")]
+    pub skip_count: Arc<AtomicU32>,
+}
+
+fn zero_atomic() -> Arc<AtomicU32> {
+    Arc::new(AtomicU32::new(0))
 }
 
 impl JobMeta {
@@ -58,7 +79,49 @@ impl JobMeta {
             one_shot,
             last_status: None,
             consecutive_errors: 0,
+            in_flight: zero_atomic(),
+            skip_count: zero_atomic(),
         }
+    }
+}
+
+/// RAII guard returned by [`JobMeta::try_acquire_in_flight`] that decrements
+/// the in-flight counter on drop (correct under panic).
+#[must_use = "InFlightGuard decrements on drop; dropping it without holding it releases the slot"]
+pub struct InFlightGuard {
+    counter: Arc<AtomicU32>,
+}
+
+impl InFlightGuard {
+    /// Attempt to reserve an in-flight slot up to `max`. Returns `None` if
+    /// `max` would be exceeded.
+    ///
+    /// Uses a `compare_exchange_weak` CAS loop so the increment is atomic
+    /// with the cap check; this rules out the two-step load+fetch_add race
+    /// where two concurrent fires both pass the check and both increment
+    /// past `max` (plan finding L4).
+    pub fn try_acquire(counter: Arc<AtomicU32>, max: u32) -> Option<Self> {
+        let mut current = counter.load(Ordering::Acquire);
+        loop {
+            if current >= max {
+                return None;
+            }
+            match counter.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(Self { counter }),
+                Err(v) => current = v,
+            }
+        }
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::Release);
     }
 }
 
@@ -202,6 +265,61 @@ impl CronScheduler {
     ///
     /// Validates the new delivery; re-uses [`CronJob::validate_delivery`] by
     /// constructing a temporary `CronJob` for the check. Persists on success.
+    /// Attempt to reserve an in-flight slot for the given job per its
+    /// `overlap_policy`. Returns `Some(guard)` if the job may dispatch and
+    /// `None` if the cap was hit (caller should skip + log).
+    ///
+    /// For `Allow`, the cap is ignored (unbounded) and a guard is always
+    /// returned. For `Queue` and `KillAndRun`, which are not implemented,
+    /// returns `None` — the dispatcher surfaces `OpenFangError::NotImplemented`.
+    pub fn try_acquire_in_flight(&self, id: CronJobId) -> Option<InFlightGuard> {
+        let meta = self.jobs.get(&id)?;
+        let policy = meta.job.overlap_policy;
+        let max = meta.job.max_in_flight.max(1);
+        let counter = Arc::clone(&meta.in_flight);
+        drop(meta);
+        match policy {
+            OverlapPolicy::Allow => {
+                counter.fetch_add(1, Ordering::AcqRel);
+                Some(InFlightGuard { counter })
+            }
+            OverlapPolicy::Skip => InFlightGuard::try_acquire(counter, max),
+            // Stubbed: return None so the dispatcher can return NotImplemented.
+            OverlapPolicy::Queue | OverlapPolicy::KillAndRun => None,
+        }
+    }
+
+    /// Increment the skip counter for a job and return the new value.
+    pub fn record_skip(&self, id: CronJobId) -> u32 {
+        match self.jobs.get(&id) {
+            Some(meta) => meta.skip_count.fetch_add(1, Ordering::AcqRel) + 1,
+            None => 0,
+        }
+    }
+
+    /// Read the current skip count without mutating.
+    pub fn skip_count(&self, id: CronJobId) -> u32 {
+        self.jobs
+            .get(&id)
+            .map(|m| m.skip_count.load(Ordering::Acquire))
+            .unwrap_or(0)
+    }
+
+    /// Update the overlap policy for an existing job.
+    pub fn set_overlap_policy(
+        &self,
+        id: CronJobId,
+        policy: OverlapPolicy,
+    ) -> OpenFangResult<()> {
+        match self.jobs.get_mut(&id) {
+            Some(mut meta) => {
+                meta.job.overlap_policy = policy;
+                Ok(())
+            }
+            None => Err(OpenFangError::Internal(format!("Cron job {id} not found"))),
+        }
+    }
+
     pub fn set_delivery(&self, id: CronJobId, delivery: CronDelivery) -> OpenFangResult<()> {
         match self.jobs.get_mut(&id) {
             Some(mut meta) => {
@@ -523,6 +641,8 @@ mod tests {
                 text: "ping".into(),
             },
             delivery: CronDelivery::None,
+            overlap_policy: OverlapPolicy::Skip,
+            max_in_flight: 1,
             created_at: Utc::now(),
             last_run: None,
             next_run: None,
@@ -775,6 +895,90 @@ mod tests {
         // Non-existent ID should fail
         let fake_id = CronJobId::new();
         assert!(sched.set_enabled(fake_id, true).is_err());
+    }
+
+    // -- InFlightGuard CAS --------------------------------------------------
+
+    #[test]
+    fn in_flight_guard_respects_max_and_releases_on_drop() {
+        let counter = Arc::new(AtomicU32::new(0));
+
+        // Acquire up to the cap.
+        let g1 = InFlightGuard::try_acquire(Arc::clone(&counter), 2).unwrap();
+        assert_eq!(counter.load(Ordering::Acquire), 1);
+        let g2 = InFlightGuard::try_acquire(Arc::clone(&counter), 2).unwrap();
+        assert_eq!(counter.load(Ordering::Acquire), 2);
+
+        // Third acquire hits the cap.
+        assert!(InFlightGuard::try_acquire(Arc::clone(&counter), 2).is_none());
+        assert_eq!(counter.load(Ordering::Acquire), 2);
+
+        // Dropping one guard frees a slot.
+        drop(g1);
+        assert_eq!(counter.load(Ordering::Acquire), 1);
+        let g3 = InFlightGuard::try_acquire(Arc::clone(&counter), 2).unwrap();
+        assert_eq!(counter.load(Ordering::Acquire), 2);
+
+        drop(g2);
+        drop(g3);
+        assert_eq!(counter.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn try_acquire_in_flight_via_scheduler_uses_policy() {
+        let (sched, _tmp) = make_scheduler(100);
+        let agent = AgentId::new();
+        let mut job = make_job(agent);
+        job.overlap_policy = OverlapPolicy::Skip;
+        job.max_in_flight = 1;
+        let id = sched.add_job(job, false).unwrap();
+
+        let g1 = sched.try_acquire_in_flight(id).unwrap();
+        assert!(sched.try_acquire_in_flight(id).is_none()); // cap hit
+        drop(g1);
+        assert!(sched.try_acquire_in_flight(id).is_some());
+    }
+
+    #[test]
+    fn try_acquire_in_flight_allow_is_unbounded() {
+        let (sched, _tmp) = make_scheduler(100);
+        let agent = AgentId::new();
+        let mut job = make_job(agent);
+        job.overlap_policy = OverlapPolicy::Allow;
+        let id = sched.add_job(job, false).unwrap();
+
+        // Should be able to acquire many, cap ignored.
+        let _g1 = sched.try_acquire_in_flight(id).unwrap();
+        let _g2 = sched.try_acquire_in_flight(id).unwrap();
+        let _g3 = sched.try_acquire_in_flight(id).unwrap();
+    }
+
+    #[test]
+    fn try_acquire_in_flight_stub_policies_return_none() {
+        let (sched, _tmp) = make_scheduler(100);
+        let agent = AgentId::new();
+
+        for policy in [OverlapPolicy::Queue, OverlapPolicy::KillAndRun] {
+            let mut job = make_job(agent);
+            job.overlap_policy = policy;
+            let id = sched.add_job(job, false).unwrap();
+            assert!(
+                sched.try_acquire_in_flight(id).is_none(),
+                "policy {policy:?} should return None (NotImplemented)"
+            );
+            sched.remove_job(id).unwrap();
+        }
+    }
+
+    #[test]
+    fn record_skip_increments() {
+        let (sched, _tmp) = make_scheduler(100);
+        let agent = AgentId::new();
+        let id = sched.add_job(make_job(agent), false).unwrap();
+        assert_eq!(sched.skip_count(id), 0);
+        assert_eq!(sched.record_skip(id), 1);
+        assert_eq!(sched.record_skip(id), 2);
+        assert_eq!(sched.skip_count(id), 2);
     }
 
     // -- test_set_delivery --------------------------------------------------

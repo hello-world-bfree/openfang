@@ -839,6 +839,8 @@ pub async fn create_workflow(
             timeout_secs: s["timeout_secs"].as_u64().unwrap_or(120),
             error_mode,
             output_var: s["output_var"].as_str().map(String::from),
+            approval_required: s["approval_required"].as_bool().unwrap_or(false),
+            approval_prompt: s["approval_prompt"].as_str().map(String::from),
         });
     }
 
@@ -1062,6 +1064,8 @@ pub async fn update_workflow(
             timeout_secs: s["timeout_secs"].as_u64().unwrap_or(120),
             error_mode,
             output_var: s["output_var"].as_str().map(String::from),
+            approval_required: s["approval_required"].as_bool().unwrap_or(false),
+            approval_prompt: s["approval_prompt"].as_str().map(String::from),
         });
     }
 
@@ -7619,6 +7623,8 @@ pub async fn test_provider(
                 temperature: 0.0,
                 system: None,
                 thinking: None,
+                cache_system_prompt: false,
+                min_cache_tokens: 0,
             };
             match driver.complete(test_req).await {
                 Ok(_) => {
@@ -9700,7 +9706,7 @@ pub async fn create_approval(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreateApprovalRequest>,
 ) -> impl IntoResponse {
-    use openfang_types::approval::{ApprovalRequest, RiskLevel};
+    use openfang_types::approval::{ApprovalRequest, ApprovalRequestType, RiskLevel};
 
     let policy = state.kernel.approval_manager.policy();
     let id = uuid::Uuid::new_v4();
@@ -9721,6 +9727,9 @@ pub async fn create_approval(
         risk_level: RiskLevel::High,
         requested_at: chrono::Utc::now(),
         timeout_secs: policy.timeout_secs,
+        request_type: ApprovalRequestType::ToolUse,
+        workflow_run_id: None,
+        step_name: None,
     };
 
     // Spawn the request in the background (it will block until resolved or timed out)
@@ -10247,6 +10256,55 @@ pub async fn toggle_cron_job(
         Err(_) => (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": "Invalid job ID"})),
+        ),
+    }
+}
+
+/// PATCH /api/cron/jobs/{id}/overlap-policy — Update the overlap policy for a job.
+///
+/// Body is a tagged `OverlapPolicy` JSON, e.g. `{"kind": "skip"}` or
+/// `{"kind": "allow"}`. `queue` and `kill_and_run` are accepted but dispatch
+/// returns `NotImplemented`.
+pub async fn set_cron_overlap_policy(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let uuid = match uuid::Uuid::parse_str(&id) {
+        Ok(u) => u,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid job ID"})),
+            );
+        }
+    };
+    let policy: openfang_types::scheduler::OverlapPolicy = match serde_json::from_value(body) {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("Invalid overlap policy: {e} (expected {{\"kind\":\"skip|allow|queue|kill_and_run\"}})")
+                })),
+            );
+        }
+    };
+    let job_id = openfang_types::scheduler::CronJobId(uuid);
+    match state.kernel.cron_scheduler.set_overlap_policy(job_id, policy) {
+        Ok(()) => {
+            let _ = state.kernel.cron_scheduler.persist();
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "id": id,
+                    "overlap_policy": policy,
+                })),
+            )
+        }
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!("{e}")})),
         ),
     }
 }

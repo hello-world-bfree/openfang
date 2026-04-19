@@ -137,6 +137,28 @@ pub enum CronAction {
 // CronDelivery
 // ---------------------------------------------------------------------------
 
+/// How the scheduler reacts when a cron job fires while a prior run is still
+/// in-flight.
+///
+/// `Skip` is the safe default — previously-overlapping jobs (e.g. a 30s
+/// schedule with a 60s agent turn) silently skip the new fire so they don't
+/// race on DB writes, LLM token budgets, or delivery-channel messages.
+/// `Allow` preserves the legacy behavior (concurrent runs) for jobs that are
+/// idempotent by design. `Queue` and `KillAndRun` are stubbed for a future
+/// release (`OpenFangError::NotImplemented` at dispatch).
+///
+/// Tagged serde (`{"kind": "skip"}`) leaves room for future per-variant data
+/// (e.g. `Queue { depth: u32 }`) without breaking on-disk JSON.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum OverlapPolicy {
+    #[default]
+    Skip,
+    Queue,
+    KillAndRun,
+    Allow,
+}
+
 /// Where the job's output is delivered.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -180,12 +202,23 @@ pub struct CronJob {
     pub action: CronAction,
     /// Where to deliver the result.
     pub delivery: CronDelivery,
+    /// What to do if a prior run is still in-flight when this fires.
+    #[serde(default)]
+    pub overlap_policy: OverlapPolicy,
+    /// Maximum concurrent runs of this job. `Skip`/`Queue`/`KillAndRun` use
+    /// this cap; `Allow` ignores it.
+    #[serde(default = "default_max_in_flight")]
+    pub max_in_flight: u32,
     /// When the job was created.
     pub created_at: DateTime<Utc>,
     /// When the job last fired (if ever).
     pub last_run: Option<DateTime<Utc>>,
     /// When the job is next expected to fire.
     pub next_run: Option<DateTime<Utc>>,
+}
+
+fn default_max_in_flight() -> u32 {
+    1
 }
 
 impl CronJob {
@@ -430,6 +463,8 @@ mod tests {
                 text: "ping".into(),
             },
             delivery: CronDelivery::None,
+            overlap_policy: OverlapPolicy::Skip,
+            max_in_flight: 1,
             created_at: Utc::now(),
             last_run: None,
             next_run: None,

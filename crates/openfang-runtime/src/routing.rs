@@ -188,6 +188,8 @@ mod tests {
             temperature: 0.7,
             system: None,
             thinking: None,
+            cache_system_prompt: false,
+            min_cache_tokens: 0,
         }
     }
 

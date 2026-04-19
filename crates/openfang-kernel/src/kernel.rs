@@ -130,7 +130,7 @@ pub struct OpenFangKernel {
     /// Cron job scheduler.
     pub cron_scheduler: crate::cron::CronScheduler,
     /// Execution approval manager.
-    pub approval_manager: crate::approval::ApprovalManager,
+    pub approval_manager: Arc<crate::approval::ApprovalManager>,
     /// Agent bindings for multi-account routing (Mutex for runtime add/remove).
     pub bindings: std::sync::Mutex<Vec<openfang_types::config::AgentBinding>>,
     /// Broadcast configuration.
@@ -1014,8 +1014,10 @@ impl OpenFangKernel {
             }
         }
 
-        // Initialize execution approval manager
-        let approval_manager = crate::approval::ApprovalManager::new(config.approval.clone());
+        // Initialize execution approval manager (Arc so WorkflowEngine can
+        // share it for step-level approval gates).
+        let approval_manager =
+            Arc::new(crate::approval::ApprovalManager::new(config.approval.clone()));
 
         // Initialize binding/broadcast/auto-reply from config
         let initial_bindings = config.bindings.clone();
@@ -1030,7 +1032,7 @@ impl OpenFangKernel {
             scheduler: AgentScheduler::new(),
             memory: memory.clone(),
             supervisor,
-            workflows: WorkflowEngine::new(),
+            workflows: WorkflowEngine::with_approval_manager(Arc::clone(&approval_manager)),
             triggers: TriggerEngine::new(),
             background,
             audit_log: Arc::new(AuditLog::with_db(memory.usage_conn())),
@@ -2066,7 +2068,7 @@ impl OpenFangKernel {
 
                     // Persist usage to database (same as non-streaming path)
                     let model = &manifest.model.model;
-                    let cost = MeteringEngine::estimate_cost_with_catalog(
+                    let cost = MeteringEngine::estimate_cost_with_cache(
                         &kernel_clone
                             .model_catalog
                             .read()
@@ -2074,6 +2076,8 @@ impl OpenFangKernel {
                         model,
                         result.total_usage.input_tokens,
                         result.total_usage.output_tokens,
+                        result.total_usage.cache_creation_input_tokens,
+                        result.total_usage.cache_read_input_tokens,
                     );
                     let _ = kernel_clone
                         .metering
@@ -2082,6 +2086,8 @@ impl OpenFangKernel {
                             model: model.clone(),
                             input_tokens: result.total_usage.input_tokens,
                             output_tokens: result.total_usage.output_tokens,
+                            cache_creation_tokens: result.total_usage.cache_creation_input_tokens,
+                            cache_read_tokens: result.total_usage.cache_read_input_tokens,
                             cost_usd: cost,
                             tool_calls: result.iterations.saturating_sub(1),
                         });
@@ -2200,10 +2206,7 @@ impl OpenFangKernel {
 
         Ok(AgentLoopResult {
             response,
-            total_usage: openfang_types::message::TokenUsage {
-                input_tokens: 0,
-                output_tokens: 0,
-            },
+            total_usage: openfang_types::message::TokenUsage::default(),
             iterations: 1,
             cost_usd: None,
             silent: false,
@@ -2260,10 +2263,7 @@ impl OpenFangKernel {
 
         Ok(AgentLoopResult {
             response: result.response,
-            total_usage: openfang_types::message::TokenUsage {
-                input_tokens: 0,
-                output_tokens: 0,
-            },
+            total_usage: openfang_types::message::TokenUsage::default(),
             cost_usd: None,
             iterations: 1,
             silent: false,
@@ -2527,6 +2527,9 @@ impl OpenFangKernel {
                 temperature: manifest.model.temperature,
                 system: Some(manifest.model.system_prompt.clone()),
                 thinking: None,
+                // Probe request only scores complexity; caching is irrelevant here.
+                cache_system_prompt: false,
+                min_cache_tokens: 0,
             };
             let (complexity, routed_model) = router.select_model(&probe);
             info!(
@@ -2623,17 +2626,21 @@ impl OpenFangKernel {
 
         // Record usage in the metering engine (uses catalog pricing as single source of truth)
         let model = &manifest.model.model;
-        let cost = MeteringEngine::estimate_cost_with_catalog(
+        let cost = MeteringEngine::estimate_cost_with_cache(
             &self.model_catalog.read().unwrap_or_else(|e| e.into_inner()),
             model,
             result.total_usage.input_tokens,
             result.total_usage.output_tokens,
+            result.total_usage.cache_creation_input_tokens,
+            result.total_usage.cache_read_input_tokens,
         );
         let _ = self.metering.record(&openfang_memory::usage::UsageRecord {
             agent_id,
             model: model.clone(),
             input_tokens: result.total_usage.input_tokens,
             output_tokens: result.total_usage.output_tokens,
+            cache_creation_tokens: result.total_usage.cache_creation_input_tokens,
+            cache_read_tokens: result.total_usage.cache_read_input_tokens,
             cost_usd: cost,
             tool_calls: result.iterations.saturating_sub(1),
         });
@@ -3352,6 +3359,7 @@ impl OpenFangKernel {
                 system_prompt: def.agent.system_prompt.clone(),
                 api_key_env: def.agent.api_key_env.clone(),
                 base_url: def.agent.base_url.clone(),
+                cache_system_prompt: false,
             },
             capabilities: ManifestCapabilities {
                 tools: def.tools.clone(),
@@ -4126,6 +4134,48 @@ impl OpenFangKernel {
                     let due = kernel.cron_scheduler.due_jobs();
                     for job in due {
                         let job_name = job.name.clone();
+
+                        // Overlap policy: acquire an in-flight slot before
+                        // dispatching. `None` = skip this fire (Skip policy
+                        // with the cap already held, or a stub policy).
+                        let Some(_guard) =
+                            kernel.cron_scheduler.try_acquire_in_flight(job.id)
+                        else {
+                            let count = kernel.cron_scheduler.record_skip(job.id);
+                            tracing::warn!(
+                                job = %job_name,
+                                skip_count = count,
+                                overlap_policy = ?job.overlap_policy,
+                                "Cron: skipping overlap"
+                            );
+                            // First skip after a successful run: notify via
+                            // the configured delivery channel so the operator
+                            // sees it without tailing logs. Only fires once
+                            // per successful-run → skip transition per the
+                            // plan (we approximate by firing only on the
+                            // first skip of this session).
+                            if count == 1 {
+                                if let Err(e) = cron_deliver_response(
+                                    &kernel,
+                                    job.agent_id,
+                                    &format!(
+                                        "[notice] Cron job '{}' skipped a fire because a prior run was still in-flight. \
+                                         To allow concurrent runs: openfang cron set-overlap-policy {} allow",
+                                        job_name, job.id
+                                    ),
+                                    &job.delivery,
+                                )
+                                .await
+                                {
+                                    tracing::debug!(
+                                        job = %job_name,
+                                        error = %e,
+                                        "Cron skip notice delivery failed (non-fatal)"
+                                    );
+                                }
+                            }
+                            continue;
+                        };
                         tracing::debug!(job = %job_name, "Cron: firing scheduled job");
                         match kernel.cron_run_job(&job).await {
                             Ok(_) => {
@@ -4135,6 +4185,7 @@ impl OpenFangKernel {
                                 tracing::warn!(job = %job_name, error = %e, "Cron job failed");
                             }
                         }
+                        // _guard drops here → in_flight decremented.
                     }
 
                     // Persist every ~5 minutes (20 ticks * 15s)
@@ -6105,6 +6156,8 @@ impl KernelHandle for OpenFangKernel {
             schedule,
             action,
             delivery,
+            overlap_policy: openfang_types::scheduler::OverlapPolicy::default(),
+            max_in_flight: 1,
             enabled: true,
             created_at: chrono::Utc::now(),
             next_run: None,
@@ -6292,6 +6345,9 @@ impl KernelHandle for OpenFangKernel {
             risk_level: crate::approval::ApprovalManager::classify_risk(tool_name),
             requested_at: chrono::Utc::now(),
             timeout_secs: policy.timeout_secs,
+            request_type: openfang_types::approval::ApprovalRequestType::ToolUse,
+            workflow_run_id: None,
+            step_name: None,
         };
 
         let decision = self.approval_manager.request_approval(req).await;

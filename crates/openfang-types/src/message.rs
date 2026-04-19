@@ -215,18 +215,38 @@ pub enum StopReason {
 }
 
 /// Token usage information from an LLM call.
+///
+/// For providers with prompt caching (currently Anthropic), `input_tokens`
+/// reports only non-cached tokens — cache-creation and cache-read are billed
+/// separately at provider-specific multipliers (Anthropic: creation ×1.25,
+/// read ×0.1 of the input rate). Drivers without caching report only
+/// `input_tokens`/`output_tokens`; the cache fields default to 0.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct TokenUsage {
     /// Tokens used for the input/prompt.
     pub input_tokens: u64,
     /// Tokens generated in the output.
     pub output_tokens: u64,
+    /// Tokens written to provider prompt cache (billed at creation rate).
+    #[serde(default)]
+    pub cache_creation_input_tokens: u64,
+    /// Tokens read from provider prompt cache (billed at read rate).
+    #[serde(default)]
+    pub cache_read_input_tokens: u64,
 }
 
 impl TokenUsage {
-    /// Total tokens used.
+    /// Total tokens used (input + output + cache creation + cache read).
     pub fn total(&self) -> u64 {
-        self.input_tokens + self.output_tokens
+        self.input_tokens
+            + self.output_tokens
+            + self.cache_creation_input_tokens
+            + self.cache_read_input_tokens
+    }
+
+    /// Whether any cache activity is reported in this usage record.
+    pub fn has_cache_activity(&self) -> bool {
+        self.cache_creation_input_tokens > 0 || self.cache_read_input_tokens > 0
     }
 }
 
@@ -265,6 +285,7 @@ mod tests {
         let usage = TokenUsage {
             input_tokens: 100,
             output_tokens: 50,
+            ..Default::default()
         };
         assert_eq!(usage.total(), 150);
     }

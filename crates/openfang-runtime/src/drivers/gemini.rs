@@ -594,6 +594,7 @@ fn convert_response(resp: GeminiResponse) -> Result<CompletionResponse, LlmError
         .map(|u| TokenUsage {
             input_tokens: u.prompt_token_count,
             output_tokens: u.candidates_token_count,
+            ..Default::default()
         })
         .unwrap_or_default();
 
@@ -1243,6 +1244,8 @@ mod tests {
             temperature: 0.7,
             system: None,
             thinking: None,
+            cache_system_prompt: false,
+            min_cache_tokens: 0,
         };
 
         let tools = convert_tools(&request);
@@ -1261,6 +1264,8 @@ mod tests {
             temperature: 0.7,
             system: None,
             thinking: None,
+            cache_system_prompt: false,
+            min_cache_tokens: 0,
         };
 
         let tools = convert_tools(&request);

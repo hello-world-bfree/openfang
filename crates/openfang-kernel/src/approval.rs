@@ -194,7 +194,7 @@ impl ApprovalManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openfang_types::approval::ApprovalPolicy;
+    use openfang_types::approval::{ApprovalPolicy, ApprovalRequestType};
     use std::sync::Arc;
 
     fn default_manager() -> ApprovalManager {
@@ -211,6 +211,9 @@ mod tests {
             risk_level: RiskLevel::High,
             requested_at: Utc::now(),
             timeout_secs,
+            request_type: ApprovalRequestType::ToolUse,
+            workflow_run_id: None,
+            step_name: None,
         }
     }
 
