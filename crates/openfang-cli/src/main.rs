@@ -677,6 +677,45 @@ enum CronCommands {
         /// Job ID.
         id: String,
     },
+    /// Trigger a job immediately (fire now, independent of schedule).
+    Trigger {
+        /// Job ID.
+        id: String,
+    },
+    /// Configure where the job's result is delivered on each fire.
+    ///
+    /// Use a subcommand per delivery kind to avoid invalid flag
+    /// combinations: `channel --channel <ch> --to <to>`, `webhook --url <u>`,
+    /// `last-channel`, or `none`.
+    SetDelivery {
+        /// Job ID.
+        id: String,
+        #[command(subcommand)]
+        kind: CronDeliveryKind,
+    },
+}
+
+#[derive(Subcommand)]
+enum CronDeliveryKind {
+    /// No delivery (fire and forget — failures are silent).
+    None,
+    /// Deliver to the last channel the agent interacted on.
+    LastChannel,
+    /// Deliver to a specific channel and recipient.
+    Channel {
+        /// Channel identifier (e.g. "discord", "telegram", "slack").
+        #[arg(long)]
+        channel: String,
+        /// Recipient within the channel (e.g. #ops, @user, chat id).
+        #[arg(long)]
+        to: String,
+    },
+    /// Deliver via HTTPS webhook. URL must begin with https://
+    Webhook {
+        /// Webhook URL (https:// required — SSRF mitigation is deferred to v1.1).
+        #[arg(long)]
+        url: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1053,6 +1092,10 @@ fn main() {
             CronCommands::Delete { id } => cmd_cron_delete(&id),
             CronCommands::Enable { id } => cmd_cron_toggle(&id, true),
             CronCommands::Disable { id } => cmd_cron_toggle(&id, false),
+            CronCommands::Trigger { id } => cmd_cron_trigger(&id),
+            CronCommands::SetDelivery { id, kind } => {
+                cmd_cron_set_delivery(&id, delivery_kind_to_json(kind))
+            }
         },
         Some(Commands::Sessions { agent, json }) => cmd_sessions(agent.as_deref(), json),
         Some(Commands::Logs { lines, follow }) => cmd_logs(lines, follow),
@@ -5736,41 +5779,88 @@ fn cmd_cron_list(json: bool) {
         );
         return;
     }
-    if let Some(arr) = body.as_array() {
-        if arr.is_empty() {
-            println!("No scheduled jobs.");
-            return;
-        }
-        println!(
-            "{:<38} {:<16} {:<20} {:<8} PROMPT",
-            "ID", "AGENT", "SCHEDULE", "ENABLED"
-        );
-        println!("{}", "-".repeat(100));
-        for j in arr {
-            println!(
-                "{:<38} {:<16} {:<20} {:<8} {}",
-                j["id"].as_str().unwrap_or("?"),
-                j["agent_id"].as_str().unwrap_or("?"),
-                j["cron_expr"].as_str().unwrap_or("?"),
-                if j["enabled"].as_bool().unwrap_or(false) {
-                    "yes"
-                } else {
-                    "no"
-                },
-                j["prompt"]
-                    .as_str()
-                    .unwrap_or("")
-                    .chars()
-                    .take(40)
-                    .collect::<String>(),
-            );
-        }
+    // Daemon returns `{"jobs":[...], "total":N}`; older variants may have
+    // returned a bare array. Handle both.
+    let jobs: Vec<&serde_json::Value> = if let Some(arr) = body.get("jobs").and_then(|v| v.as_array()) {
+        arr.iter().collect()
+    } else if let Some(arr) = body.as_array() {
+        arr.iter().collect()
     } else {
         println!(
             "{}",
             serde_json::to_string_pretty(&body).unwrap_or_default()
         );
+        return;
+    };
+    if jobs.is_empty() {
+        println!("No scheduled jobs.");
+        return;
     }
+    println!(
+        "{:<12} {:<18} {:<20} {:<8} {:<24} NAME",
+        "ID", "AGENT", "SCHEDULE", "ENABLED", "DELIVERY"
+    );
+    println!("{}", "-".repeat(110));
+    for j in jobs {
+        let id_short: String = j["id"].as_str().unwrap_or("?").chars().take(8).collect();
+        let agent_short: String = j["agent_id"]
+            .as_str()
+            .unwrap_or("?")
+            .chars()
+            .take(16)
+            .collect();
+        let schedule = render_schedule(&j["schedule"]);
+        let delivery = render_delivery(&j["delivery"]);
+        println!(
+            "{:<12} {:<18} {:<20} {:<8} {:<24} {}",
+            id_short,
+            agent_short,
+            schedule,
+            if j["enabled"].as_bool().unwrap_or(false) {
+                "yes"
+            } else {
+                "no"
+            },
+            delivery,
+            j["name"].as_str().unwrap_or(""),
+        );
+    }
+}
+
+/// Render a cron schedule value into a short fixed-width column string.
+fn render_schedule(v: &serde_json::Value) -> String {
+    match v["kind"].as_str() {
+        Some("cron") => v["expr"].as_str().unwrap_or("?").to_string(),
+        Some("every") => format!("every {}s", v["every_secs"].as_u64().unwrap_or(0)),
+        Some("at") => format!("at {}", v["at"].as_str().unwrap_or("?")),
+        _ => "?".to_string(),
+    }
+    .chars()
+    .take(20)
+    .collect()
+}
+
+/// Render a `CronDelivery` JSON object into a short fixed-width column string.
+fn render_delivery(v: &serde_json::Value) -> String {
+    let s = match v["kind"].as_str() {
+        Some("none") | None => "none".to_string(),
+        Some("last_channel") => "last_channel".to_string(),
+        Some("channel") => format!(
+            "{}:{}",
+            v["channel"].as_str().unwrap_or("?"),
+            v["to"].as_str().unwrap_or("?"),
+        ),
+        Some("webhook") => {
+            let url = v["url"].as_str().unwrap_or("?");
+            if url.len() > 20 {
+                format!("webhook:{}...", &url[..12])
+            } else {
+                format!("webhook:{url}")
+            }
+        }
+        Some(other) => other.to_string(),
+    };
+    s.chars().take(24).collect()
 }
 
 fn cmd_cron_create(agent: &str, spec: &str, prompt: &str, explicit_name: Option<&str>) {
@@ -5818,8 +5908,20 @@ fn cmd_cron_create(agent: &str, spec: &str, prompt: &str, explicit_name: Option<
             }))
             .send(),
     );
-    if let Some(id) = body["id"].as_str() {
+    // Daemon returns the wrapped shape `{"result": {"id": "..."}}` since
+    // `create_cron_job` wraps via `cron_create`.
+    let id_field = body
+        .get("result")
+        .and_then(|r| r.get("id"))
+        .and_then(|v| v.as_str())
+        .or_else(|| body.get("id").and_then(|v| v.as_str()));
+    if let Some(id) = id_field {
         ui::success(&format!("Cron job created: {id}"));
+        eprintln!(
+            "Warning: no delivery configured — failures will be silent. \
+             Run 'openfang cron set-delivery {id} channel --channel <ch> --to <to>' \
+             (or 'webhook --url https://...') to route output."
+        );
     } else {
         ui::error(&format!(
             "Failed: {}",
@@ -5858,6 +5960,53 @@ fn cmd_cron_toggle(id: &str, enable: bool) {
         ));
     } else {
         ui::success(&format!("Cron job {id} {endpoint}d."));
+    }
+}
+
+/// Convert the CLI `CronDeliveryKind` subcommand into the tagged JSON body the
+/// daemon's `PATCH /api/cron/jobs/{id}/delivery` endpoint accepts.
+fn delivery_kind_to_json(kind: CronDeliveryKind) -> serde_json::Value {
+    use serde_json::json;
+    match kind {
+        CronDeliveryKind::None => json!({ "kind": "none" }),
+        CronDeliveryKind::LastChannel => json!({ "kind": "last_channel" }),
+        CronDeliveryKind::Channel { channel, to } => json!({
+            "kind": "channel",
+            "channel": channel,
+            "to": to,
+        }),
+        CronDeliveryKind::Webhook { url } => json!({ "kind": "webhook", "url": url }),
+    }
+}
+
+fn cmd_cron_set_delivery(id: &str, delivery: serde_json::Value) {
+    let base = require_daemon("cron set-delivery");
+    let client = daemon_client();
+    let body = daemon_json(
+        client
+            .patch(format!("{base}/api/cron/jobs/{id}/delivery"))
+            .json(&delivery)
+            .send(),
+    );
+    if let Some(err) = body.get("error").and_then(|v| v.as_str()) {
+        ui::error(&format!("Failed: {err}"));
+    } else {
+        ui::success(&format!("Cron job {id} delivery updated."));
+    }
+}
+
+fn cmd_cron_trigger(id: &str) {
+    let base = require_daemon("cron trigger");
+    let client = daemon_client();
+    let body = daemon_json(
+        client
+            .post(format!("{base}/api/cron/jobs/{id}/run"))
+            .send(),
+    );
+    if let Some(err) = body.get("error").and_then(|v| v.as_str()) {
+        ui::error(&format!("Failed: {err}"));
+    } else {
+        ui::success(&format!("Cron job {id} triggered."));
     }
 }
 

@@ -10251,6 +10251,61 @@ pub async fn toggle_cron_job(
     }
 }
 
+/// PATCH /api/cron/jobs/{id}/delivery — Update delivery configuration for a job.
+///
+/// Body is a tagged `CronDelivery` JSON, e.g.
+/// `{"kind":"channel","channel":"discord","to":"#ops"}` or
+/// `{"kind":"webhook","url":"https://..."}`. Invalid delivery variants are
+/// rejected with 400.
+pub async fn set_cron_delivery(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let uuid = match uuid::Uuid::parse_str(&id) {
+        Ok(u) => u,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid job ID"})),
+            );
+        }
+    };
+    let delivery: openfang_types::scheduler::CronDelivery =
+        match serde_json::from_value(body) {
+            Ok(d) => d,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": format!("Invalid delivery body: {e} (expected {{\"kind\":\"...\",...}})")
+                    })),
+                );
+            }
+        };
+    let job_id = openfang_types::scheduler::CronJobId(uuid);
+    match state
+        .kernel
+        .cron_scheduler
+        .set_delivery(job_id, delivery.clone())
+    {
+        Ok(()) => {
+            let _ = state.kernel.cron_scheduler.persist();
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "id": id,
+                    "delivery": delivery,
+                })),
+            )
+        }
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!("{e}")})),
+        ),
+    }
+}
+
 /// GET /api/cron/jobs/{id}/status — Get status of a specific cron job.
 pub async fn cron_job_status(
     State(state): State<Arc<AppState>>,

@@ -340,7 +340,10 @@ impl CronJob {
         Ok(())
     }
 
-    fn validate_delivery(&self) -> Result<(), String> {
+    /// Validate just the `delivery` field. Public so that out-of-band mutations
+    /// (e.g. `PATCH /api/cron/jobs/{id}/delivery`) can re-check only this field
+    /// without rerunning the full per-agent count + name + schedule checks.
+    pub fn validate_delivery(&self) -> Result<(), String> {
         match &self.delivery {
             CronDelivery::Channel { channel, to } => {
                 if channel.is_empty() {
@@ -351,8 +354,11 @@ impl CronJob {
                 }
             }
             CronDelivery::Webhook { url } => {
-                if !url.starts_with("http://") && !url.starts_with("https://") {
-                    return Err("webhook URL must start with http:// or https://".into());
+                // Webhook URLs must be https only. Full SSRF mitigation
+                // (RFC1918/IMDS/link-local blocking at connect time) is deferred
+                // to v1.1; see __docs/cron-delivery-schema.md for the threat model.
+                if !url.starts_with("https://") {
+                    return Err("webhook URL must start with https:// (http:// not allowed)".into());
                 }
                 if url.len() > MAX_WEBHOOK_URL_LEN {
                     return Err(format!(
@@ -770,7 +776,7 @@ mod tests {
             url: "ftp://example.com/hook".into(),
         };
         let err = job.validate(0).unwrap_err();
-        assert!(err.contains("http://"), "{err}");
+        assert!(err.contains("https://"), "{err}");
     }
 
     #[test]
@@ -784,12 +790,14 @@ mod tests {
     }
 
     #[test]
-    fn webhook_http_ok() {
+    fn webhook_http_rejected() {
+        // Plain HTTP is no longer allowed for webhook delivery.
         let mut job = valid_job();
         job.delivery = CronDelivery::Webhook {
             url: "http://localhost:8080/hook".into(),
         };
-        assert!(job.validate(0).is_ok());
+        let err = job.validate(0).unwrap_err();
+        assert!(err.contains("https://"), "{err}");
     }
 
     #[test]

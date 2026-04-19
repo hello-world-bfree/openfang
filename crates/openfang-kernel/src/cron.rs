@@ -11,7 +11,7 @@ use chrono::{Duration, Utc};
 use dashmap::DashMap;
 use openfang_types::agent::AgentId;
 use openfang_types::error::{OpenFangError, OpenFangResult};
-use openfang_types::scheduler::{CronJob, CronJobId, CronSchedule};
+use openfang_types::scheduler::{CronDelivery, CronJob, CronJobId, CronSchedule};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -192,6 +192,25 @@ impl CronScheduler {
                     meta.consecutive_errors = 0;
                     meta.job.next_run = Some(compute_next_run(&meta.job.schedule));
                 }
+                Ok(())
+            }
+            None => Err(OpenFangError::Internal(format!("Cron job {id} not found"))),
+        }
+    }
+
+    /// Update the delivery configuration for an existing job.
+    ///
+    /// Validates the new delivery; re-uses [`CronJob::validate_delivery`] by
+    /// constructing a temporary `CronJob` for the check. Persists on success.
+    pub fn set_delivery(&self, id: CronJobId, delivery: CronDelivery) -> OpenFangResult<()> {
+        match self.jobs.get_mut(&id) {
+            Some(mut meta) => {
+                let mut candidate = meta.job.clone();
+                candidate.delivery = delivery.clone();
+                candidate
+                    .validate_delivery()
+                    .map_err(OpenFangError::InvalidInput)?;
+                meta.job.delivery = delivery;
                 Ok(())
             }
             None => Err(OpenFangError::Internal(format!("Cron job {id} not found"))),
@@ -756,6 +775,75 @@ mod tests {
         // Non-existent ID should fail
         let fake_id = CronJobId::new();
         assert!(sched.set_enabled(fake_id, true).is_err());
+    }
+
+    // -- test_set_delivery --------------------------------------------------
+
+    #[test]
+    fn test_set_delivery() {
+        let (sched, _tmp) = make_scheduler(100);
+        let agent = AgentId::new();
+        let job = make_job(agent);
+        let id = sched.add_job(job, false).unwrap();
+
+        // Default delivery should be None.
+        let meta = sched.get_meta(id).unwrap();
+        assert!(matches!(meta.job.delivery, CronDelivery::None));
+
+        // Update to Channel.
+        sched
+            .set_delivery(
+                id,
+                CronDelivery::Channel {
+                    channel: "discord".into(),
+                    to: "#ops".into(),
+                },
+            )
+            .unwrap();
+        let meta = sched.get_meta(id).unwrap();
+        match meta.job.delivery {
+            CronDelivery::Channel { channel, to } => {
+                assert_eq!(channel, "discord");
+                assert_eq!(to, "#ops");
+            }
+            other => panic!("expected Channel, got {other:?}"),
+        }
+
+        // Invalid delivery (channel + empty recipient) should be rejected and
+        // the existing delivery should be preserved.
+        let err = sched
+            .set_delivery(
+                id,
+                CronDelivery::Channel {
+                    channel: "slack".into(),
+                    to: String::new(),
+                },
+            )
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("recipient"), "{msg}");
+        // Previous delivery preserved.
+        let meta = sched.get_meta(id).unwrap();
+        assert!(matches!(meta.job.delivery, CronDelivery::Channel { .. }));
+
+        // http:// webhook URL should be rejected (https-only policy).
+        let err = sched
+            .set_delivery(
+                id,
+                CronDelivery::Webhook {
+                    url: "http://example.com/hook".into(),
+                },
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("https://"));
+
+        // Non-existent ID should fail.
+        let fake = CronJobId::new();
+        assert!(
+            sched
+                .set_delivery(fake, CronDelivery::LastChannel)
+                .is_err()
+        );
     }
 
     // -- test_persist_and_load ----------------------------------------------

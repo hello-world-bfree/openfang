@@ -1639,9 +1639,10 @@ mod tests {
         let opt = serde_json::json!({"value": 42});
         assert_eq!(option_value_to_string(&opt), Some("42".to_string()));
 
-        // Float value
-        let opt = serde_json::json!({"value": 3.14});
-        assert_eq!(option_value_to_string(&opt), Some("3.14".to_string()));
+        // Float value (use a non-PI-approximating literal so clippy::approx_constant
+        // doesn't misread test data as a math constant).
+        let opt = serde_json::json!({"value": 2.5});
+        assert_eq!(option_value_to_string(&opt), Some("2.5".to_string()));
 
         // Boolean value
         let opt = serde_json::json!({"value": true});

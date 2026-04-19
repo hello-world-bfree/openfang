@@ -785,11 +785,32 @@ impl OpenFangKernel {
             skill_registry.freeze();
         }
 
-        // Initialize hand registry (curated autonomous packages)
-        let hand_registry = openfang_hands::registry::HandRegistry::new();
+        // Initialize hand registry (curated autonomous packages).
+        //
+        // Trust boundary: `<home_dir>/hands/` is assumed user-owned; any writer
+        // to this directory can register a hand template at next boot. On a
+        // single-user machine this is equivalent to trusting the filesystem.
+        let hands_dir = config.home_dir.join("hands");
+        let hand_registry =
+            openfang_hands::registry::HandRegistry::with_hands_dir(&hands_dir);
         let hand_count = hand_registry.load_bundled();
         if hand_count > 0 {
             info!("Loaded {hand_count} bundled hand(s)");
+        }
+        // User-installed hands at `<home_dir>/hands/<id>/HAND.toml`. Runs after
+        // bundled load so the bundled-wins collision policy takes effect. Must
+        // run before `start_background_agents()` later replays `hand_state.json`
+        // so user-hand instances find their templates registered.
+        match hand_registry.load_user_hands(&hands_dir) {
+            Ok(n) if n > 0 => info!(
+                "Loaded {n} user hand(s) from {}",
+                hands_dir.display()
+            ),
+            Ok(_) => {}
+            Err(e) => warn!(
+                "Failed to scan user hands dir {}: {e}",
+                hands_dir.display()
+            ),
         }
 
         // Initialize extension/integration registry

@@ -41,14 +41,40 @@ pub struct HandRegistry {
     definitions: DashMap<String, HandDefinition>,
     /// Active hand instances, keyed by instance UUID.
     instances: DashMap<Uuid, HandInstance>,
+    /// Optional on-disk directory for user-installed hand templates.
+    ///
+    /// When set, [`install_from_path`](Self::install_from_path) and
+    /// [`install_from_content`](Self::install_from_content) write
+    /// `HAND.toml` to `<hands_dir>/<id>/` so the hand survives daemon restart.
+    /// [`load_user_hands`](Self::load_user_hands) reads from the same directory
+    /// on boot.
+    hands_dir: Option<std::path::PathBuf>,
 }
 
 impl HandRegistry {
-    /// Create an empty registry.
+    /// Create an empty registry with no on-disk persistence. User-installed
+    /// hands will not survive daemon restart.
+    ///
+    /// Prefer [`with_hands_dir`](Self::with_hands_dir) in production paths.
     pub fn new() -> Self {
         Self {
             definitions: DashMap::new(),
             instances: DashMap::new(),
+            hands_dir: None,
+        }
+    }
+
+    /// Create a registry backed by a disk directory for user-installed hands.
+    ///
+    /// The directory layout is `<hands_dir>/<hand_id>/HAND.toml` (optionally
+    /// with a sibling `SKILL.md`). [`install_from_path`](Self::install_from_path)
+    /// writes into this layout; [`load_user_hands`](Self::load_user_hands)
+    /// reads from it on boot.
+    pub fn with_hands_dir(hands_dir: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            definitions: DashMap::new(),
+            instances: DashMap::new(),
+            hands_dir: Some(hands_dir.into()),
         }
     }
 
@@ -125,6 +151,11 @@ impl HandRegistry {
     }
 
     /// Install a hand from a directory containing HAND.toml (and optional SKILL.md).
+    ///
+    /// If the registry was constructed with [`with_hands_dir`](Self::with_hands_dir),
+    /// the validated `HAND.toml` (and any sibling `SKILL.md`) are *copied* into
+    /// `<hands_dir>/<id>/` so the hand survives daemon restart. Without a
+    /// hands_dir, the template lives only in memory until the daemon stops.
     pub fn install_from_path(&self, path: &std::path::Path) -> HandResult<HandDefinition> {
         let toml_path = path.join("HAND.toml");
         let skill_path = path.join("SKILL.md");
@@ -136,6 +167,11 @@ impl HandRegistry {
 
         let def = bundled::parse_bundled("custom", &toml_content, &skill_content)?;
 
+        // Reject hand ids that could traverse out of the hands directory or
+        // contain path separators. Path-safe ids are required for the
+        // on-disk persistence layout `<hands_dir>/<id>/HAND.toml`.
+        validate_hand_id(&def.id)?;
+
         if self.definitions.contains_key(&def.id) {
             return Err(HandError::AlreadyActive(format!(
                 "Hand '{}' already registered",
@@ -143,9 +179,112 @@ impl HandRegistry {
             )));
         }
 
-        info!(hand = %def.id, name = %def.name, path = %path.display(), "Installed hand from path");
+        // Persist to disk if a hands_dir is configured so the template
+        // survives daemon restart (without this, rescan on boot finds nothing).
+        if let Some(hands_dir) = &self.hands_dir {
+            let target_dir = hands_dir.join(&def.id);
+            std::fs::create_dir_all(&target_dir).map_err(|e| {
+                HandError::Config(format!(
+                    "Failed to create hand directory {}: {e}",
+                    target_dir.display()
+                ))
+            })?;
+            std::fs::write(target_dir.join("HAND.toml"), toml_content.as_bytes())
+                .map_err(|e| HandError::Config(format!("Failed to persist HAND.toml: {e}")))?;
+            if !skill_content.is_empty() {
+                std::fs::write(target_dir.join("SKILL.md"), skill_content.as_bytes())
+                    .map_err(|e| HandError::Config(format!("Failed to persist SKILL.md: {e}")))?;
+            }
+            info!(
+                hand = %def.id,
+                name = %def.name,
+                target = %target_dir.display(),
+                "Installed and persisted hand"
+            );
+        } else {
+            info!(
+                hand = %def.id,
+                name = %def.name,
+                path = %path.display(),
+                "Installed hand from path (in-memory only; configure hands_dir for persistence)"
+            );
+        }
         self.definitions.insert(def.id.clone(), def.clone());
         Ok(def)
+    }
+
+    /// Load all user-installed hand templates from an on-disk directory.
+    ///
+    /// Walks `<hands_dir>/*/HAND.toml`, parses each, and registers valid
+    /// definitions. Non-fatal per-entry errors (bad TOML, unsafe id, collision
+    /// with a previously-loaded definition) are logged as warnings and the
+    /// scan continues.
+    ///
+    /// **Collision policy**: if a user hand has the same `id` as an existing
+    /// registered definition (typically a bundled hand loaded just before
+    /// this scan), the user hand is **skipped** and a warning is logged.
+    /// Bundled definitions always win.
+    ///
+    /// Returns the number of user hand templates successfully registered.
+    pub fn load_user_hands(&self, hands_dir: &std::path::Path) -> HandResult<usize> {
+        if !hands_dir.is_dir() {
+            return Ok(0);
+        }
+        let entries = std::fs::read_dir(hands_dir).map_err(|e| {
+            HandError::Config(format!(
+                "Cannot read hands dir {}: {e}",
+                hands_dir.display()
+            ))
+        })?;
+
+        let mut count = 0usize;
+        for entry in entries.flatten() {
+            let dir_path = entry.path();
+            if !dir_path.is_dir() {
+                continue;
+            }
+            let toml_path = dir_path.join("HAND.toml");
+            if !toml_path.is_file() {
+                // Likely a partial download or a non-hand directory; skip silently.
+                continue;
+            }
+            let toml_content = match std::fs::read_to_string(&toml_path) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(path = %toml_path.display(), error = %e, "Skipping user hand: cannot read HAND.toml");
+                    continue;
+                }
+            };
+            let skill_content = std::fs::read_to_string(dir_path.join("SKILL.md")).unwrap_or_default();
+
+            let def = match bundled::parse_bundled("custom", &toml_content, &skill_content) {
+                Ok(d) => d,
+                Err(e) => {
+                    warn!(path = %toml_path.display(), error = %e, "Skipping user hand: invalid HAND.toml");
+                    continue;
+                }
+            };
+
+            if let Err(e) = validate_hand_id(&def.id) {
+                warn!(path = %toml_path.display(), error = %e, "Skipping user hand: unsafe id");
+                continue;
+            }
+
+            // Bundled-wins collision policy.
+            if self.definitions.contains_key(&def.id) {
+                warn!(
+                    hand = %def.id,
+                    path = %toml_path.display(),
+                    "Skipped user hand: collides with already-registered template (bundled wins)"
+                );
+                continue;
+            }
+
+            info!(hand = %def.id, name = %def.name, "Loaded user hand");
+            self.definitions.insert(def.id.clone(), def);
+            count += 1;
+        }
+        Ok(count)
     }
 
     /// Install a hand from raw TOML + skill content (for API-based installs).
@@ -421,6 +560,30 @@ impl Default for HandRegistry {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Reject hand ids that would traverse out of the hands directory or produce
+/// an unsafe on-disk path. Allowed: lowercase alphanumerics, hyphens,
+/// underscores. Dots and path separators are rejected.
+fn validate_hand_id(id: &str) -> HandResult<()> {
+    if id.is_empty() {
+        return Err(HandError::Config("hand id must not be empty".into()));
+    }
+    if id.len() > 64 {
+        return Err(HandError::Config(format!(
+            "hand id too long ({} chars, max 64)",
+            id.len()
+        )));
+    }
+    for ch in id.chars() {
+        let ok = ch.is_ascii_alphanumeric() || ch == '-' || ch == '_';
+        if !ok {
+            return Err(HandError::Config(format!(
+                "hand id '{id}' contains disallowed character {ch:?} (allowed: a-z A-Z 0-9 - _)"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Check if a single requirement is satisfied.
@@ -882,6 +1045,179 @@ mod tests {
         assert!(!r.degraded);
 
         reg.deactivate(instance.instance_id).unwrap();
+    }
+
+    // ─── hand id validation ────────────────────────────────────────────────
+
+    #[test]
+    fn validate_hand_id_accepts_clean_ids() {
+        assert!(validate_hand_id("coder").is_ok());
+        assert!(validate_hand_id("doc-curator").is_ok());
+        assert!(validate_hand_id("library_v2").is_ok());
+        assert!(validate_hand_id("ABC123").is_ok());
+    }
+
+    #[test]
+    fn validate_hand_id_rejects_path_traversal() {
+        assert!(validate_hand_id("../etc/passwd").is_err());
+        assert!(validate_hand_id("foo/bar").is_err());
+        assert!(validate_hand_id("..").is_err());
+        assert!(validate_hand_id("foo.bar").is_err());
+        assert!(validate_hand_id("").is_err());
+        assert!(validate_hand_id(&"x".repeat(65)).is_err());
+    }
+
+    // ─── load_user_hands ───────────────────────────────────────────────────
+
+    /// Render a minimal valid HAND.toml for a given id.
+    fn minimal_hand_toml(id: &str) -> String {
+        format!(
+            r#"id = "{id}"
+name = "Test Hand {id}"
+description = "test hand"
+category = "productivity"
+
+[agent]
+name = "test-agent-{id}"
+description = "test agent"
+system_prompt = "You are a test agent."
+"#
+        )
+    }
+
+    #[test]
+    fn load_user_hands_missing_dir_returns_zero() {
+        let reg = HandRegistry::new();
+        let tmp = tempfile::tempdir().unwrap();
+        let nonexistent = tmp.path().join("does-not-exist");
+        assert_eq!(reg.load_user_hands(&nonexistent).unwrap(), 0);
+    }
+
+    #[test]
+    fn load_user_hands_reads_valid_templates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hands_dir = tmp.path();
+
+        // Valid hand 'alpha'
+        let alpha = hands_dir.join("alpha");
+        std::fs::create_dir_all(&alpha).unwrap();
+        std::fs::write(alpha.join("HAND.toml"), minimal_hand_toml("alpha")).unwrap();
+
+        // Valid hand 'beta' with skill
+        let beta = hands_dir.join("beta");
+        std::fs::create_dir_all(&beta).unwrap();
+        std::fs::write(beta.join("HAND.toml"), minimal_hand_toml("beta")).unwrap();
+        std::fs::write(beta.join("SKILL.md"), "# Beta skill").unwrap();
+
+        let reg = HandRegistry::new();
+        let count = reg.load_user_hands(hands_dir).unwrap();
+        assert_eq!(count, 2);
+        assert!(reg.get_definition("alpha").is_some());
+        assert!(reg.get_definition("beta").is_some());
+
+        // Skill attached when present
+        let beta_def = reg.get_definition("beta").unwrap();
+        assert_eq!(beta_def.skill_content.as_deref(), Some("# Beta skill"));
+    }
+
+    #[test]
+    fn load_user_hands_skips_malformed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hands_dir = tmp.path();
+
+        // Valid
+        let ok = hands_dir.join("ok");
+        std::fs::create_dir_all(&ok).unwrap();
+        std::fs::write(ok.join("HAND.toml"), minimal_hand_toml("ok")).unwrap();
+
+        // Malformed TOML
+        let bad = hands_dir.join("bad");
+        std::fs::create_dir_all(&bad).unwrap();
+        std::fs::write(bad.join("HAND.toml"), "this is not [toml").unwrap();
+
+        // Missing HAND.toml (silent skip)
+        std::fs::create_dir_all(hands_dir.join("empty-dir")).unwrap();
+
+        // Not a directory — should be silently skipped
+        std::fs::write(hands_dir.join("stray.txt"), "ignore me").unwrap();
+
+        let reg = HandRegistry::new();
+        let count = reg.load_user_hands(hands_dir).unwrap();
+        assert_eq!(count, 1, "only 'ok' should load");
+        assert!(reg.get_definition("ok").is_some());
+        assert!(reg.get_definition("bad").is_none());
+    }
+
+    #[test]
+    fn load_user_hands_respects_bundled_collision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hands_dir = tmp.path();
+
+        // Collides with a bundled hand ('clip')
+        let collision = hands_dir.join("clip");
+        std::fs::create_dir_all(&collision).unwrap();
+        std::fs::write(collision.join("HAND.toml"), minimal_hand_toml("clip")).unwrap();
+
+        // Non-colliding custom hand
+        let custom = hands_dir.join("custom-hand");
+        std::fs::create_dir_all(&custom).unwrap();
+        std::fs::write(
+            custom.join("HAND.toml"),
+            minimal_hand_toml("custom-hand"),
+        )
+        .unwrap();
+
+        let reg = HandRegistry::new();
+        reg.load_bundled(); // seed bundled hands first — this is the production order
+        let count = reg.load_user_hands(hands_dir).unwrap();
+        assert_eq!(count, 1, "only custom-hand loads; clip collides with bundled");
+        assert!(reg.get_definition("custom-hand").is_some());
+
+        // Bundled 'clip' should still be the original, not the user override.
+        let clip = reg.get_definition("clip").unwrap();
+        assert_eq!(clip.name, "Clip Hand"); // bundled name
+    }
+
+    // ─── install_from_path persistence ─────────────────────────────────────
+
+    #[test]
+    fn install_from_path_writes_to_disk_when_hands_dir_configured() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hands_dir = tmp.path().join("hands");
+
+        // Source dir with the user's HAND.toml
+        let source = tmp.path().join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("HAND.toml"), minimal_hand_toml("my-hand")).unwrap();
+        std::fs::write(source.join("SKILL.md"), "# My skill").unwrap();
+
+        let reg = HandRegistry::with_hands_dir(&hands_dir);
+        let def = reg.install_from_path(&source).unwrap();
+        assert_eq!(def.id, "my-hand");
+
+        // Files persisted
+        let target = hands_dir.join("my-hand");
+        assert!(target.join("HAND.toml").is_file());
+        assert!(target.join("SKILL.md").is_file());
+
+        // Round-trip: fresh registry rescans and finds the hand
+        let fresh = HandRegistry::new();
+        let count = fresh.load_user_hands(&hands_dir).unwrap();
+        assert_eq!(count, 1);
+        assert!(fresh.get_definition("my-hand").is_some());
+    }
+
+    #[test]
+    fn install_from_path_without_hands_dir_is_in_memory_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("HAND.toml"), minimal_hand_toml("mem-only")).unwrap();
+
+        let reg = HandRegistry::new();
+        let def = reg.install_from_path(&source).unwrap();
+        assert_eq!(def.id, "mem-only");
+        // No hands_dir → nothing written anywhere but the source itself.
     }
 
     #[test]

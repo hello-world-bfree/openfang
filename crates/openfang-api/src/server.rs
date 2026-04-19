@@ -588,6 +588,10 @@ pub async fn build_router(
             axum::routing::put(routes::toggle_cron_job),
         )
         .route(
+            "/api/cron/jobs/{id}/delivery",
+            axum::routing::patch(routes::set_cron_delivery),
+        )
+        .route(
             "/api/cron/jobs/{id}/status",
             axum::routing::get(routes::cron_job_status),
         )
