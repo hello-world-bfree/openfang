@@ -261,10 +261,6 @@ impl CronScheduler {
         }
     }
 
-    /// Update the delivery configuration for an existing job.
-    ///
-    /// Validates the new delivery; re-uses [`CronJob::validate_delivery`] by
-    /// constructing a temporary `CronJob` for the check. Persists on success.
     /// Attempt to reserve an in-flight slot for the given job per its
     /// `overlap_policy`. Returns `Some(guard)` if the job may dispatch and
     /// `None` if the cap was hit (caller should skip + log).
@@ -320,6 +316,8 @@ impl CronScheduler {
         }
     }
 
+    /// Update the legacy single-destination delivery configuration for an
+    /// existing job. Validates via [`CronJob::validate_delivery`].
     pub fn set_delivery(&self, id: CronJobId, delivery: CronDelivery) -> OpenFangResult<()> {
         match self.jobs.get_mut(&id) {
             Some(mut meta) => {
@@ -329,6 +327,25 @@ impl CronScheduler {
                     .validate_delivery()
                     .map_err(OpenFangError::InvalidInput)?;
                 meta.job.delivery = delivery;
+                Ok(())
+            }
+            None => Err(OpenFangError::Internal(format!("Cron job {id} not found"))),
+        }
+    }
+
+    /// Replace the multi-destination delivery targets on an existing job.
+    ///
+    /// The schedule, action, and primary `delivery` field are left untouched;
+    /// only the `delivery_targets` fan-out list is swapped in. Call
+    /// [`persist`] afterwards to write the change to disk.
+    pub fn set_delivery_targets(
+        &self,
+        id: CronJobId,
+        targets: Vec<openfang_types::scheduler::CronDeliveryTarget>,
+    ) -> OpenFangResult<()> {
+        match self.jobs.get_mut(&id) {
+            Some(mut meta) => {
+                meta.job.delivery_targets = targets;
                 Ok(())
             }
             None => Err(OpenFangError::Internal(format!("Cron job {id} not found"))),
@@ -641,6 +658,7 @@ mod tests {
                 text: "ping".into(),
             },
             delivery: CronDelivery::None,
+            delivery_targets: Vec::new(),
             overlap_policy: OverlapPolicy::Skip,
             max_in_flight: 1,
             created_at: Utc::now(),

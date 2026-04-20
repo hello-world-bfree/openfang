@@ -186,6 +186,53 @@ pub enum CronDelivery {
 }
 
 // ---------------------------------------------------------------------------
+// CronDeliveryTarget (multi-destination fan-out)
+// ---------------------------------------------------------------------------
+
+/// A single destination for multi-destination cron output fan-out.
+///
+/// A cron job may declare zero or more `CronDeliveryTarget`s on its
+/// `delivery_targets` field. When the job fires and produces output, the
+/// delivery engine sends the same output to every target concurrently.
+/// Failures in one target do not abort delivery to the others.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CronDeliveryTarget {
+    /// Deliver via an existing channel adapter (Telegram/Slack/Discord/etc.).
+    Channel {
+        /// Which adapter to use (e.g. `"telegram"`, `"slack"`).
+        channel_type: String,
+        /// Platform-specific recipient (chat ID, user ID, etc.).
+        recipient: String,
+    },
+    /// Deliver via HTTP POST to a webhook URL with a JSON payload.
+    Webhook {
+        /// Destination URL (`http://` or `https://`).
+        url: String,
+        /// Optional `Authorization` header value sent verbatim.
+        #[serde(default)]
+        auth_header: Option<String>,
+    },
+    /// Append or overwrite a local file on disk.
+    LocalFile {
+        /// Absolute or relative path to the output file.
+        path: String,
+        /// If `true`, append to the file; if `false`, overwrite.
+        #[serde(default)]
+        append: bool,
+    },
+    /// Deliver via the existing email channel adapter.
+    Email {
+        /// Recipient email address.
+        to: String,
+        /// Optional subject template (e.g. `"Cron: {job}"`). Literal `{job}`
+        /// placeholders are replaced with the job name at send time.
+        #[serde(default)]
+        subject_template: Option<String>,
+    },
+}
+
+// ---------------------------------------------------------------------------
 // CronJob
 // ---------------------------------------------------------------------------
 
@@ -204,8 +251,12 @@ pub struct CronJob {
     pub schedule: CronSchedule,
     /// What to do when fired.
     pub action: CronAction,
-    /// Where to deliver the result.
+    /// Where to deliver the result (single legacy destination).
     pub delivery: CronDelivery,
+    /// Additional fan-out destinations. May be empty; each target is
+    /// delivered concurrently after the job produces its output.
+    #[serde(default)]
+    pub delivery_targets: Vec<CronDeliveryTarget>,
     /// What to do if a prior run is still in-flight when this fires.
     #[serde(default)]
     pub overlap_policy: OverlapPolicy,
@@ -391,9 +442,7 @@ impl CronJob {
                 }
             }
             CronDelivery::Webhook { url } => {
-                // Webhook URLs must be https only. Full SSRF mitigation
-                // (RFC1918/IMDS/link-local blocking at connect time) is deferred
-                // to v1.1; see __docs/cron-delivery-schema.md for the threat model.
+                // Webhook URLs must be https only.
                 if !url.starts_with("https://") {
                     return Err("webhook URL must start with https:// (http:// not allowed)".into());
                 }
@@ -403,11 +452,92 @@ impl CronJob {
                         url.len()
                     ));
                 }
+                // SSRF mitigation: reject private/loopback/link-local/metadata
+                // hostnames at validation time. Full connect-time DNS-rebinding
+                // defense is deferred; see __docs/cron-delivery-schema.md.
+                if is_private_or_reserved_host(url) {
+                    return Err(
+                        "webhook URL must not target private, loopback, or link-local addresses \
+                         (set cron.webhook_private_cidrs_allowed in config.toml for dev)"
+                            .into(),
+                    );
+                }
             }
             CronDelivery::None | CronDelivery::LastChannel => {}
         }
         Ok(())
     }
+}
+
+// ---------------------------------------------------------------------------
+// SSRF guard — reject private / loopback / link-local / metadata hostnames.
+//
+// Validation-time check only. A follow-up hardening (connect-time IP
+// re-resolution) is required to defend against DNS rebinding. See the
+// `__docs/cron-delivery-schema.md` threat model.
+// ---------------------------------------------------------------------------
+
+/// Return `true` if `url_str` points to a private, loopback, link-local,
+/// broadcast, or known-metadata host. Used to block SSRF via webhook delivery.
+///
+/// Assumes `url_str` already passed the `https://` prefix check.
+pub(crate) fn is_private_or_reserved_host(url_str: &str) -> bool {
+    use std::net::IpAddr;
+
+    let authority = url_str
+        .trim_start_matches("https://")
+        .split('/')
+        .next()
+        .unwrap_or("");
+
+    // Extract host, handling bracketed IPv6 (`[::1]:port`) and bare host:port.
+    let host = if let Some(rest) = authority.strip_prefix('[') {
+        // `[ipv6]` or `[ipv6]:port`
+        rest.split(']').next().unwrap_or("")
+    } else {
+        // bare host or host:port
+        authority.split(':').next().unwrap_or("")
+    };
+
+    if host.is_empty() {
+        return true;
+    }
+
+    // Reject localhost aliases by name.
+    if matches!(host, "localhost" | "localhost.localdomain") {
+        return true;
+    }
+
+    // Reject known cloud-metadata hostnames by name.
+    if host == "metadata.google.internal"
+        || host == "metadata"
+        || host.ends_with(".internal")
+    {
+        return true;
+    }
+
+    // Parse as IP — catches raw-IP bypasses (169.254.169.254, 10.0.0.1, etc.).
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return match ip {
+            IpAddr::V4(v4) => {
+                v4.is_loopback()
+                    || v4.is_private()
+                    || v4.is_link_local()
+                    || v4.is_broadcast()
+                    || v4.is_documentation()
+                    || v4.is_unspecified()
+            }
+            IpAddr::V6(v6) => {
+                v6.is_loopback()
+                    || v6.is_unspecified()
+                    || v6.is_multicast()
+                    // ULA fc00::/7
+                    || matches!(v6.segments()[0] & 0xfe00, 0xfc00)
+            }
+        };
+    }
+
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -467,6 +597,7 @@ mod tests {
                 text: "ping".into(),
             },
             delivery: CronDelivery::None,
+            delivery_targets: Vec::new(),
             overlap_policy: OverlapPolicy::Skip,
             max_in_flight: 1,
             created_at: Utc::now(),
@@ -737,7 +868,7 @@ mod tests {
         job.action = CronAction::AgentTurn {
             message: "hello".into(),
             model_override: None,
-            timeout_secs: Some(601),
+            timeout_secs: Some(MAX_TIMEOUT_SECS + 1),
         };
         let err = job.validate(0).unwrap_err();
         assert!(err.contains("too large"), "{err}");
@@ -846,6 +977,85 @@ mod tests {
             url: "https://example.com/hook".into(),
         };
         assert!(job.validate(0).is_ok());
+    }
+
+    // -- SSRF guard --
+
+    #[test]
+    fn webhook_loopback_v4_rejected() {
+        let mut job = valid_job();
+        job.delivery = CronDelivery::Webhook {
+            url: "https://127.0.0.1/hook".into(),
+        };
+        let err = job.validate(0).unwrap_err();
+        assert!(err.contains("private"), "{err}");
+    }
+
+    #[test]
+    fn webhook_private_rfc1918_rejected() {
+        for addr in ["10.0.0.1", "172.16.0.1", "192.168.1.1"] {
+            let mut job = valid_job();
+            job.delivery = CronDelivery::Webhook {
+                url: format!("https://{addr}/hook"),
+            };
+            let err = job
+                .validate(0)
+                .unwrap_err();
+            assert!(err.contains("private"), "{addr}: {err}");
+        }
+    }
+
+    #[test]
+    fn webhook_link_local_imds_rejected() {
+        let mut job = valid_job();
+        job.delivery = CronDelivery::Webhook {
+            url: "https://169.254.169.254/latest/meta-data/".into(),
+        };
+        let err = job.validate(0).unwrap_err();
+        assert!(err.contains("private"), "{err}");
+    }
+
+    #[test]
+    fn webhook_localhost_alias_rejected() {
+        let mut job = valid_job();
+        job.delivery = CronDelivery::Webhook {
+            url: "https://localhost:8443/hook".into(),
+        };
+        let err = job.validate(0).unwrap_err();
+        assert!(err.contains("private"), "{err}");
+    }
+
+    #[test]
+    fn webhook_metadata_gcp_rejected() {
+        let mut job = valid_job();
+        job.delivery = CronDelivery::Webhook {
+            url: "https://metadata.google.internal/computeMetadata/v1/".into(),
+        };
+        let err = job.validate(0).unwrap_err();
+        assert!(err.contains("private"), "{err}");
+    }
+
+    #[test]
+    fn webhook_loopback_v6_rejected() {
+        let mut job = valid_job();
+        job.delivery = CronDelivery::Webhook {
+            url: "https://[::1]/hook".into(),
+        };
+        let err = job.validate(0).unwrap_err();
+        assert!(err.contains("private"), "{err}");
+    }
+
+    #[test]
+    fn is_private_guard_unit() {
+        assert!(is_private_or_reserved_host("https://127.0.0.1/x"));
+        assert!(is_private_or_reserved_host("https://10.0.0.1:8080/x"));
+        assert!(is_private_or_reserved_host("https://localhost/x"));
+        assert!(is_private_or_reserved_host("https://169.254.169.254/x"));
+        assert!(is_private_or_reserved_host("https://metadata.google.internal/x"));
+        assert!(is_private_or_reserved_host("https://foo.internal/x"));
+        assert!(!is_private_or_reserved_host("https://example.com/x"));
+        assert!(!is_private_or_reserved_host("https://1.1.1.1/x"));
+        assert!(!is_private_or_reserved_host("https://8.8.8.8:443/x"));
     }
 
     // -- Delivery: None / LastChannel --
