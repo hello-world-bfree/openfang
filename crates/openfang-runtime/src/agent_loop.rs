@@ -142,7 +142,11 @@ fn min_cache_tokens_for(model_id: &str) -> u32 {
     if !is_anthropic {
         return 0;
     }
-    if lower.contains("haiku") { 2048 } else { 1024 }
+    if lower.contains("haiku") {
+        2048
+    } else {
+        1024
+    }
 }
 
 /// Agent lifecycle phase within the execution loop.
@@ -4699,6 +4703,8 @@ mod tests {
                     usage: TokenUsage {
                         input_tokens: 18,
                         output_tokens: 10,
+                        cache_creation_input_tokens: 0,
+                        cache_read_input_tokens: 0,
                     },
                 })
             } else {
@@ -4712,6 +4718,8 @@ mod tests {
                     usage: TokenUsage {
                         input_tokens: 24,
                         output_tokens: 8,
+                        cache_creation_input_tokens: 0,
+                        cache_read_input_tokens: 0,
                     },
                 })
             }

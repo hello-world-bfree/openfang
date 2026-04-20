@@ -3310,7 +3310,10 @@ fn cmd_workflow_run(workflow_id: &str, input: &str) {
     )) {
         let has_gate = def_body["steps"]
             .as_array()
-            .map(|s| s.iter().any(|st| st["approval_required"].as_bool().unwrap_or(false)))
+            .map(|s| {
+                s.iter()
+                    .any(|st| st["approval_required"].as_bool().unwrap_or(false))
+            })
             .unwrap_or(false);
         if has_gate {
             eprintln!(
@@ -6100,17 +6103,18 @@ fn cmd_cron_list(json: bool) {
     }
     // Daemon returns `{"jobs":[...], "total":N}`; older variants may have
     // returned a bare array. Handle both.
-    let jobs: Vec<&serde_json::Value> = if let Some(arr) = body.get("jobs").and_then(|v| v.as_array()) {
-        arr.iter().collect()
-    } else if let Some(arr) = body.as_array() {
-        arr.iter().collect()
-    } else {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&body).unwrap_or_default()
-        );
-        return;
-    };
+    let jobs: Vec<&serde_json::Value> =
+        if let Some(arr) = body.get("jobs").and_then(|v| v.as_array()) {
+            arr.iter().collect()
+        } else if let Some(arr) = body.as_array() {
+            arr.iter().collect()
+        } else {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&body).unwrap_or_default()
+            );
+            return;
+        };
     if jobs.is_empty() {
         println!("No scheduled jobs.");
         return;
@@ -6337,11 +6341,7 @@ fn cmd_cron_set_delivery(id: &str, delivery: serde_json::Value) {
 fn cmd_cron_trigger(id: &str) {
     let base = require_daemon("cron trigger");
     let client = daemon_client();
-    let body = daemon_json(
-        client
-            .post(format!("{base}/api/cron/jobs/{id}/run"))
-            .send(),
-    );
+    let body = daemon_json(client.post(format!("{base}/api/cron/jobs/{id}/run")).send());
     if let Some(err) = body.get("error").and_then(|v| v.as_str()) {
         ui::error(&format!("Failed: {err}"));
     } else {

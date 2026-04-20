@@ -8036,7 +8036,9 @@ fn build_skill_config_snapshot(
             .read()
             .unwrap_or_else(|e| e.into_inner());
         let source: &std::collections::HashMap<String, std::collections::HashMap<String, String>> =
-            override_guard.as_ref().unwrap_or(&state.kernel.config.skills);
+            override_guard
+                .as_ref()
+                .unwrap_or(&state.kernel.config.skills);
         source.get(skill_name).cloned().unwrap_or_default()
     };
 
@@ -8398,7 +8400,9 @@ fn remove_skill_config_var(
 
     let mut remove_skill = false;
     if let Some(skills_table) = root.get_mut("skills").and_then(|v| v.as_table_mut()) {
-        if let Some(skill_section) = skills_table.get_mut(skill_name).and_then(|v| v.as_table_mut())
+        if let Some(skill_section) = skills_table
+            .get_mut(skill_name)
+            .and_then(|v| v.as_table_mut())
         {
             skill_section.remove(var_name);
             if skill_section.is_empty() {
@@ -9025,9 +9029,8 @@ pub async fn create_schedule(
     }
     if let Some(arr) = delivery_targets_raw.as_array() {
         for (idx, t) in arr.iter().enumerate() {
-            if let Err(e) = serde_json::from_value::<
-                openfang_types::scheduler::CronDeliveryTarget,
-            >(t.clone())
+            if let Err(e) =
+                serde_json::from_value::<openfang_types::scheduler::CronDeliveryTarget>(t.clone())
             {
                 return (
                     StatusCode::BAD_REQUEST,
@@ -9158,9 +9161,8 @@ pub async fn update_schedule(
         let mut parsed: Vec<openfang_types::scheduler::CronDeliveryTarget> =
             Vec::with_capacity(arr.len());
         for (idx, t) in arr.iter().enumerate() {
-            match serde_json::from_value::<openfang_types::scheduler::CronDeliveryTarget>(
-                t.clone(),
-            ) {
+            match serde_json::from_value::<openfang_types::scheduler::CronDeliveryTarget>(t.clone())
+            {
                 Ok(dt) => parsed.push(dt),
                 Err(e) => {
                     return (
@@ -11026,7 +11028,11 @@ pub async fn set_cron_overlap_policy(
         }
     };
     let job_id = openfang_types::scheduler::CronJobId(uuid);
-    match state.kernel.cron_scheduler.set_overlap_policy(job_id, policy) {
+    match state
+        .kernel
+        .cron_scheduler
+        .set_overlap_policy(job_id, policy)
+    {
         Ok(()) => {
             let _ = state.kernel.cron_scheduler.persist();
             (
@@ -11064,18 +11070,17 @@ pub async fn set_cron_delivery(
             );
         }
     };
-    let delivery: openfang_types::scheduler::CronDelivery =
-        match serde_json::from_value(body) {
-            Ok(d) => d,
-            Err(e) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({
-                        "error": format!("Invalid delivery body: {e} (expected {{\"kind\":\"...\",...}})")
-                    })),
-                );
-            }
-        };
+    let delivery: openfang_types::scheduler::CronDelivery = match serde_json::from_value(body) {
+        Ok(d) => d,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("Invalid delivery body: {e} (expected {{\"kind\":\"...\",...}})")
+                })),
+            );
+        }
+    };
     let job_id = openfang_types::scheduler::CronJobId(uuid);
     match state
         .kernel

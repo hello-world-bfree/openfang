@@ -11,9 +11,7 @@ use chrono::{Duration, Utc};
 use dashmap::DashMap;
 use openfang_types::agent::AgentId;
 use openfang_types::error::{OpenFangError, OpenFangResult};
-use openfang_types::scheduler::{
-    CronDelivery, CronJob, CronJobId, CronSchedule, OverlapPolicy,
-};
+use openfang_types::scheduler::{CronDelivery, CronJob, CronJobId, CronSchedule, OverlapPolicy};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
@@ -302,11 +300,7 @@ impl CronScheduler {
     }
 
     /// Update the overlap policy for an existing job.
-    pub fn set_overlap_policy(
-        &self,
-        id: CronJobId,
-        policy: OverlapPolicy,
-    ) -> OpenFangResult<()> {
+    pub fn set_overlap_policy(&self, id: CronJobId, policy: OverlapPolicy) -> OpenFangResult<()> {
         match self.jobs.get_mut(&id) {
             Some(mut meta) => {
                 meta.job.overlap_policy = policy;
@@ -1061,11 +1055,7 @@ mod tests {
 
         // Non-existent ID should fail.
         let fake = CronJobId::new();
-        assert!(
-            sched
-                .set_delivery(fake, CronDelivery::LastChannel)
-                .is_err()
-        );
+        assert!(sched.set_delivery(fake, CronDelivery::LastChannel).is_err());
     }
 
     // -- test_persist_and_load ----------------------------------------------

@@ -909,10 +909,7 @@ mod tests {
     #[test]
     fn mrkdwn_bold_double_star() {
         assert_eq!(markdown_to_slack_mrkdwn("**bold**"), "*bold*");
-        assert_eq!(
-            markdown_to_slack_mrkdwn("a **bold** b"),
-            "a *bold* b"
-        );
+        assert_eq!(markdown_to_slack_mrkdwn("a **bold** b"), "a *bold* b");
     }
 
     #[test]

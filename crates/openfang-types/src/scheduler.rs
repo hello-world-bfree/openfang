@@ -509,10 +509,7 @@ pub(crate) fn is_private_or_reserved_host(url_str: &str) -> bool {
     }
 
     // Reject known cloud-metadata hostnames by name.
-    if host == "metadata.google.internal"
-        || host == "metadata"
-        || host.ends_with(".internal")
-    {
+    if host == "metadata.google.internal" || host == "metadata" || host.ends_with(".internal") {
         return true;
     }
 
@@ -998,9 +995,7 @@ mod tests {
             job.delivery = CronDelivery::Webhook {
                 url: format!("https://{addr}/hook"),
             };
-            let err = job
-                .validate(0)
-                .unwrap_err();
+            let err = job.validate(0).unwrap_err();
             assert!(err.contains("private"), "{addr}: {err}");
         }
     }
@@ -1051,7 +1046,9 @@ mod tests {
         assert!(is_private_or_reserved_host("https://10.0.0.1:8080/x"));
         assert!(is_private_or_reserved_host("https://localhost/x"));
         assert!(is_private_or_reserved_host("https://169.254.169.254/x"));
-        assert!(is_private_or_reserved_host("https://metadata.google.internal/x"));
+        assert!(is_private_or_reserved_host(
+            "https://metadata.google.internal/x"
+        ));
         assert!(is_private_or_reserved_host("https://foo.internal/x"));
         assert!(!is_private_or_reserved_host("https://example.com/x"));
         assert!(!is_private_or_reserved_host("https://1.1.1.1/x"));

@@ -234,7 +234,9 @@ fn build_api_request(request: &CompletionRequest, stream: bool) -> ApiRequest {
             block_type: "text",
             text,
             cache_control: if attach_cache {
-                Some(ApiCacheControl { cache_type: "ephemeral" })
+                Some(ApiCacheControl {
+                    cache_type: "ephemeral",
+                })
             } else {
                 None
             },
@@ -863,7 +865,10 @@ mod tests {
         let api = build_api_request(&req, false);
         let blocks = api.system.expect("system present");
         assert_eq!(blocks.len(), 1);
-        let cc = blocks[0].cache_control.as_ref().expect("cache_control present");
+        let cc = blocks[0]
+            .cache_control
+            .as_ref()
+            .expect("cache_control present");
         assert_eq!(cc.cache_type, "ephemeral");
     }
 
@@ -914,5 +919,4 @@ mod tests {
         assert_eq!(usage.cache_creation_input_tokens, 1800);
         assert_eq!(usage.cache_read_input_tokens, 0);
     }
-
 }

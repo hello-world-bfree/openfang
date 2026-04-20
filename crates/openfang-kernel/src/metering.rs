@@ -224,10 +224,8 @@ impl MeteringEngine {
         let input_cost = (input_tokens as f64 / 1_000_000.0) * input_per_m;
         let output_cost = (output_tokens as f64 / 1_000_000.0) * output_per_m;
         // Cache creation: 1.25× input rate. Cache read: 0.10× input rate.
-        let cache_create_cost =
-            (cache_creation_tokens as f64 / 1_000_000.0) * input_per_m * 1.25;
-        let cache_read_cost =
-            (cache_read_tokens as f64 / 1_000_000.0) * input_per_m * 0.10;
+        let cache_create_cost = (cache_creation_tokens as f64 / 1_000_000.0) * input_per_m * 1.25;
+        let cache_read_cost = (cache_read_tokens as f64 / 1_000_000.0) * input_per_m * 0.10;
         input_cost + output_cost + cache_create_cost + cache_read_cost
     }
 
@@ -846,12 +844,8 @@ mod tests {
     fn test_estimate_cost_with_cache_zero_cache_matches_legacy() {
         // With both cache fields 0, cost must equal estimate_cost_with_catalog.
         let catalog = openfang_runtime::model_catalog::ModelCatalog::default();
-        let legacy = MeteringEngine::estimate_cost_with_catalog(
-            &catalog,
-            "claude-sonnet-4-6",
-            5_000,
-            2_000,
-        );
+        let legacy =
+            MeteringEngine::estimate_cost_with_catalog(&catalog, "claude-sonnet-4-6", 5_000, 2_000);
         let cached = MeteringEngine::estimate_cost_with_cache(
             &catalog,
             "claude-sonnet-4-6",

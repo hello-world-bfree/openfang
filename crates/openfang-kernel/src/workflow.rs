@@ -120,9 +120,19 @@ fn default_timeout() -> u64 {
 /// warning; v1.1 will inspect agent capabilities properly.
 fn step_name_implies_fetch(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
-    ["fetch", "web", "curl", "github", "gh", "http", "researcher", "coder", "clip"]
-        .iter()
-        .any(|needle| n.contains(needle))
+    [
+        "fetch",
+        "web",
+        "curl",
+        "github",
+        "gh",
+        "http",
+        "researcher",
+        "coder",
+        "clip",
+    ]
+    .iter()
+    .any(|needle| n.contains(needle))
 }
 
 /// Heuristic: does this step name suggest the step runs shell commands?
@@ -268,9 +278,7 @@ impl WorkflowEngine {
     }
 
     /// Create a workflow engine wired to an approval manager.
-    pub fn with_approval_manager(
-        approval_manager: Arc<crate::approval::ApprovalManager>,
-    ) -> Self {
+    pub fn with_approval_manager(approval_manager: Arc<crate::approval::ApprovalManager>) -> Self {
         Self {
             workflows: Arc::new(RwLock::new(HashMap::new())),
             runs: Arc::new(RwLock::new(HashMap::new())),
@@ -472,15 +480,12 @@ impl WorkflowEngine {
 
         let policy = mgr.policy();
         let approval_id = uuid::Uuid::new_v4();
-        let description = step
-            .approval_prompt
-            .clone()
-            .unwrap_or_else(|| {
-                format!(
-                    "Workflow step '{}' routed to agent '{}' requires approval before dispatch",
-                    step.name, agent_name
-                )
-            });
+        let description = step.approval_prompt.clone().unwrap_or_else(|| {
+            format!(
+                "Workflow step '{}' routed to agent '{}' requires approval before dispatch",
+                step.name, agent_name
+            )
+        });
         let req = ApprovalRequest {
             id: approval_id,
             agent_id: agent_name.to_string(),
@@ -673,10 +678,7 @@ impl WorkflowEngine {
                     // the await — the helper transitions state under a short
                     // write guard, then releases it, then awaits the oneshot.
                     if step.approval_required {
-                        if let Err(e) = self
-                            .await_gate(run_id, step, &agent_name)
-                            .await
-                        {
+                        if let Err(e) = self.await_gate(run_id, step, &agent_name).await {
                             if let Some(r) = self.runs.write().await.get_mut(&run_id) {
                                 r.state = WorkflowRunState::Failed;
                                 r.error = Some(e.clone());

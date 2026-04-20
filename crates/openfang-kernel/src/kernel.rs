@@ -856,8 +856,7 @@ impl OpenFangKernel {
         // to this directory can register a hand template at next boot. On a
         // single-user machine this is equivalent to trusting the filesystem.
         let hands_dir = config.home_dir.join("hands");
-        let hand_registry =
-            openfang_hands::registry::HandRegistry::with_hands_dir(&hands_dir);
+        let hand_registry = openfang_hands::registry::HandRegistry::with_hands_dir(&hands_dir);
         let hand_count = hand_registry.load_bundled();
         if hand_count > 0 {
             info!("Loaded {hand_count} bundled hand(s)");
@@ -867,15 +866,9 @@ impl OpenFangKernel {
         // run before `start_background_agents()` later replays `hand_state.json`
         // so user-hand instances find their templates registered.
         match hand_registry.load_user_hands(&hands_dir) {
-            Ok(n) if n > 0 => info!(
-                "Loaded {n} user hand(s) from {}",
-                hands_dir.display()
-            ),
+            Ok(n) if n > 0 => info!("Loaded {n} user hand(s) from {}", hands_dir.display()),
             Ok(_) => {}
-            Err(e) => warn!(
-                "Failed to scan user hands dir {}: {e}",
-                hands_dir.display()
-            ),
+            Err(e) => warn!("Failed to scan user hands dir {}: {e}", hands_dir.display()),
         }
 
         // Load custom hands from the user's workspace (issue #984).
@@ -1135,8 +1128,9 @@ impl OpenFangKernel {
 
         // Initialize execution approval manager (Arc so WorkflowEngine can
         // share it for step-level approval gates).
-        let approval_manager =
-            Arc::new(crate::approval::ApprovalManager::new(config.approval.clone()));
+        let approval_manager = Arc::new(crate::approval::ApprovalManager::new(
+            config.approval.clone(),
+        ));
 
         // Initialize binding/broadcast/auto-reply from config
         let initial_bindings = config.bindings.clone();
@@ -4358,8 +4352,7 @@ impl OpenFangKernel {
                         // Overlap policy: acquire an in-flight slot before
                         // dispatching. `None` = skip this fire (Skip policy
                         // with the cap already held, or a stub policy).
-                        let Some(_guard) =
-                            kernel.cron_scheduler.try_acquire_in_flight(job.id)
+                        let Some(_guard) = kernel.cron_scheduler.try_acquire_in_flight(job.id)
                         else {
                             let count = kernel.cron_scheduler.record_skip(job.id);
                             tracing::warn!(
@@ -4915,6 +4908,8 @@ impl OpenFangKernel {
             },
             delivery: CronDelivery::None,
             delivery_targets: Vec::new(),
+            overlap_policy: openfang_types::scheduler::OverlapPolicy::default(),
+            max_in_flight: 1,
             created_at: chrono::Utc::now(),
             last_run: None,
             next_run: None,
@@ -5713,10 +5708,8 @@ impl OpenFangKernel {
                 if !tools_unrestricted {
                     let full_match = declared_tools.iter().any(|d| d == &t.name);
                     let server_match = declared_tools.iter().any(|d| {
-                        let expected_prefix = format!(
-                            "mcp_{}_",
-                            openfang_runtime::mcp::normalize_name(d),
-                        );
+                        let expected_prefix =
+                            format!("mcp_{}_", openfang_runtime::mcp::normalize_name(d),);
                         let normalized_tool = openfang_runtime::mcp::normalize_name(&t.name);
                         normalized_tool.starts_with(&expected_prefix)
                     });
@@ -6474,11 +6467,7 @@ struct KernelCronBridge {
 
 #[async_trait]
 impl openfang_channels::bridge::ChannelBridgeHandle for KernelCronBridge {
-    async fn send_message(
-        &self,
-        _agent_id: AgentId,
-        _message: &str,
-    ) -> Result<String, String> {
+    async fn send_message(&self, _agent_id: AgentId, _message: &str) -> Result<String, String> {
         Err("KernelCronBridge only supports send_channel_message".to_string())
     }
 

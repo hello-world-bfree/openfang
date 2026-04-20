@@ -343,7 +343,8 @@ impl HandRegistry {
                     continue;
                 }
             };
-            let skill_content = std::fs::read_to_string(dir_path.join("SKILL.md")).unwrap_or_default();
+            let skill_content =
+                std::fs::read_to_string(dir_path.join("SKILL.md")).unwrap_or_default();
 
             let def = match bundled::parse_bundled("custom", &toml_content, &skill_content) {
                 Ok(d) => d,
@@ -1290,16 +1291,15 @@ system_prompt = "You are a test agent."
         // Non-colliding custom hand
         let custom = hands_dir.join("custom-hand");
         std::fs::create_dir_all(&custom).unwrap();
-        std::fs::write(
-            custom.join("HAND.toml"),
-            minimal_hand_toml("custom-hand"),
-        )
-        .unwrap();
+        std::fs::write(custom.join("HAND.toml"), minimal_hand_toml("custom-hand")).unwrap();
 
         let reg = HandRegistry::new();
         reg.load_bundled(); // seed bundled hands first — this is the production order
         let count = reg.load_user_hands(hands_dir).unwrap();
-        assert_eq!(count, 1, "only custom-hand loads; clip collides with bundled");
+        assert_eq!(
+            count, 1,
+            "only custom-hand loads; clip collides with bundled"
+        );
         assert!(reg.get_definition("custom-hand").is_some());
 
         // Bundled 'clip' should still be the original, not the user override.

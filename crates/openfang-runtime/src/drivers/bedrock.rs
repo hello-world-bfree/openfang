@@ -654,6 +654,9 @@ fn convert_response(resp: ConverseResponse) -> Result<CompletionResponse, LlmErr
         usage: TokenUsage {
             input_tokens: resp.usage.input_tokens,
             output_tokens: resp.usage.output_tokens,
+            // Bedrock Converse API does not expose prompt-cache token counts.
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
         },
     })
 }

@@ -230,9 +230,8 @@ impl DiscordAdapter {
         interaction_token: &str,
         text: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let url = format!(
-            "{DISCORD_API_BASE}/webhooks/{app_id}/{interaction_token}/messages/@original"
-        );
+        let url =
+            format!("{DISCORD_API_BASE}/webhooks/{app_id}/{interaction_token}/messages/@original");
         let body = serde_json::json!({ "content": text });
         let resp = self.client.patch(&url).json(&body).send().await?;
 
@@ -245,9 +244,7 @@ impl DiscordAdapter {
                 .chars()
                 .take(256)
                 .collect();
-            return Err(
-                format!("Discord edit interaction failed ({status}): {body_text}").into(),
-            );
+            return Err(format!("Discord edit interaction failed ({status}): {body_text}").into());
         }
         Ok(())
     }
@@ -293,9 +290,8 @@ async fn ack_interaction(
     interaction_id: &str,
     interaction_token: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let url = format!(
-        "{DISCORD_API_BASE}/interactions/{interaction_id}/{interaction_token}/callback"
-    );
+    let url =
+        format!("{DISCORD_API_BASE}/interactions/{interaction_id}/{interaction_token}/callback");
     let body = serde_json::json!({ "type": 5 });
     let resp = client.post(&url).json(&body).send().await?;
 
@@ -866,10 +862,8 @@ impl ChannelAdapter for DiscordAdapter {
                                         d["user"]["id"].as_str().unwrap_or("").to_string();
                                     let username =
                                         d["user"]["username"].as_str().unwrap_or("unknown");
-                                    let app_id = d["application"]["id"]
-                                        .as_str()
-                                        .unwrap_or("")
-                                        .to_string();
+                                    let app_id =
+                                        d["application"]["id"].as_str().unwrap_or("").to_string();
                                     let sid = d["session_id"].as_str().unwrap_or("").to_string();
                                     let resume_url =
                                         d["resume_gateway_url"].as_str().unwrap_or("").to_string();
@@ -930,18 +924,17 @@ impl ChannelAdapter for DiscordAdapter {
                                     // Only handle application commands (type 2) for now
                                     let interaction_type = d["type"].as_u64().unwrap_or(0);
                                     if interaction_type != 2 {
-                                        debug!("Discord: ignoring interaction type {interaction_type}");
+                                        debug!(
+                                            "Discord: ignoring interaction type {interaction_type}"
+                                        );
                                         continue;
                                     }
 
-                                    let interaction_id =
-                                        d["id"].as_str().unwrap_or("").to_string();
+                                    let interaction_id = d["id"].as_str().unwrap_or("").to_string();
                                     let interaction_token =
                                         d["token"].as_str().unwrap_or("").to_string();
-                                    let app_id = d["application_id"]
-                                        .as_str()
-                                        .unwrap_or("")
-                                        .to_string();
+                                    let app_id =
+                                        d["application_id"].as_str().unwrap_or("").to_string();
                                     let channel_id =
                                         d["channel_id"].as_str().unwrap_or("").to_string();
 
@@ -996,16 +989,13 @@ impl ChannelAdapter for DiscordAdapter {
 
                                     // Extract command name and options
                                     let data = &d["data"];
-                                    let cmd_name =
-                                        data["name"].as_str().unwrap_or("").to_string();
+                                    let cmd_name = data["name"].as_str().unwrap_or("").to_string();
                                     if cmd_name.is_empty() {
                                         continue;
                                     }
 
-                                    let (name, args) = flatten_interaction_options(
-                                        &cmd_name,
-                                        &data["options"],
-                                    );
+                                    let (name, args) =
+                                        flatten_interaction_options(&cmd_name, &data["options"]);
 
                                     let is_group = d["guild_id"].as_str().is_some();
 
@@ -1153,30 +1143,20 @@ impl ChannelAdapter for DiscordAdapter {
             // First chunk: edit the deferred "thinking..." message
             let fallback_channel = ctx.channel_id.clone();
             let edit_ok = self
-                .edit_interaction_original(
-                    &ctx.application_id,
-                    &ctx.interaction_token,
-                    chunks[0],
-                )
+                .edit_interaction_original(&ctx.application_id, &ctx.interaction_token, chunks[0])
                 .await
                 .is_ok();
 
             if !edit_ok {
                 // Fallback: send as regular channel message (token expired, etc.)
-                warn!(
-                    "Discord: interaction edit failed, falling back to channel"
-                );
+                warn!("Discord: interaction edit failed, falling back to channel");
                 return self.api_send_message(&fallback_channel, &text).await;
             }
 
             // Remaining chunks: follow-up messages
             for chunk in &chunks[1..] {
                 if self
-                    .send_interaction_followup(
-                        &ctx.application_id,
-                        &ctx.interaction_token,
-                        chunk,
-                    )
+                    .send_interaction_followup(&ctx.application_id, &ctx.interaction_token, chunk)
                     .await
                     .is_err()
                 {
@@ -1824,11 +1804,23 @@ mod tests {
         // Every definition must have a name, type, and description
         for def in &defs {
             assert!(def["name"].as_str().is_some(), "command missing name");
-            assert_eq!(def["type"].as_u64(), Some(1), "command type must be CHAT_INPUT (1)");
-            assert!(def["description"].as_str().is_some(), "command missing description");
+            assert_eq!(
+                def["type"].as_u64(),
+                Some(1),
+                "command type must be CHAT_INPUT (1)"
+            );
+            assert!(
+                def["description"].as_str().is_some(),
+                "command missing description"
+            );
             // Description must be <= 100 chars
             let desc = def["description"].as_str().unwrap();
-            assert!(desc.len() <= 100, "description too long for {}: {} chars", def["name"], desc.len());
+            assert!(
+                desc.len() <= 100,
+                "description too long for {}: {} chars",
+                def["name"],
+                desc.len()
+            );
         }
     }
 
