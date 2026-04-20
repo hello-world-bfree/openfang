@@ -194,12 +194,29 @@ impl McpConnection {
             .filter_map(|item| item.as_text().map(|tc| tc.text.as_str()))
             .collect();
 
-        if texts.is_empty() {
-            // Fallback: serialize the entire result
-            Ok(serde_json::to_string(&result).unwrap_or_default())
-        } else {
-            Ok(texts.join("\n"))
-        }
+        // MCP servers return two parallel payloads per the 2025-06-18 spec:
+        //   - `content` — human-readable text summaries (what the LLM usually
+        //     needs to see in-line)
+        //   - `structured_content` — structured JSON data (query rows, tool
+        //     result objects, etc.)
+        // Some servers (notably dbx) only put row data in `structured_content`
+        // and leave `content` as a one-line summary like "Query returned 3
+        // rows". If we drop `structured_content` on the floor the LLM never
+        // sees the actual data and has to guess. Append a serialized form so
+        // the agent can read it.
+        let structured_json = result
+            .structured_content
+            .as_ref()
+            .map(|sc| serde_json::to_string(sc).unwrap_or_default())
+            .filter(|s| !s.is_empty() && s != "null");
+
+        let combined = match (texts.is_empty(), structured_json) {
+            (true, None) => serde_json::to_string(&result).unwrap_or_default(),
+            (true, Some(sc)) => sc,
+            (false, None) => texts.join("\n"),
+            (false, Some(sc)) => format!("{}\n\nstructured_content: {sc}", texts.join("\n")),
+        };
+        Ok(combined)
     }
 
     /// Get the discovered tool definitions.

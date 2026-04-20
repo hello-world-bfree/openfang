@@ -5248,9 +5248,28 @@ impl OpenFangKernel {
                     .collect()
             };
             for t in mcp_candidates {
-                // If agent declares specific tools, only include matching MCP tools
-                if !tools_unrestricted && !declared_tools.iter().any(|d| d == &t.name) {
-                    continue;
+                // If agent declares specific tools, match either the full tool
+                // name (e.g. "mcp_dbx_execute_query") OR a server-prefix
+                // shorthand (e.g. "dbx" matches any tool whose name starts
+                // with "mcp_dbx_"; "docs_mcp" matches "mcp_docs-mcp_*").
+                // Uses `normalize_name` so `"docs_mcp"` and `"docs-mcp"`
+                // compare equal. Without this, an agent that declares
+                // `tools = ["dbx"]` or `"docs_mcp"` sees zero MCP tools
+                // because actual tool names are prefixed with the server id
+                // and may contain hyphens the simple splitter doesn't handle.
+                if !tools_unrestricted {
+                    let full_match = declared_tools.iter().any(|d| d == &t.name);
+                    let server_match = declared_tools.iter().any(|d| {
+                        let expected_prefix = format!(
+                            "mcp_{}_",
+                            openfang_runtime::mcp::normalize_name(d),
+                        );
+                        let normalized_tool = openfang_runtime::mcp::normalize_name(&t.name);
+                        normalized_tool.starts_with(&expected_prefix)
+                    });
+                    if !full_match && !server_match {
+                        continue;
+                    }
                 }
                 all_tools.push(t);
             }

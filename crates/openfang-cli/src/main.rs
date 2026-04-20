@@ -5999,19 +5999,21 @@ fn cmd_cron_delete(id: &str) {
 fn cmd_cron_toggle(id: &str, enable: bool) {
     let base = require_daemon("cron");
     let client = daemon_client();
-    let endpoint = if enable { "enable" } else { "disable" };
+    // Route is PUT /api/cron/jobs/{id}/enable with body {"enabled": bool}.
     let body = daemon_json(
         client
-            .post(format!("{base}/api/cron/jobs/{id}/{endpoint}"))
+            .put(format!("{base}/api/cron/jobs/{id}/enable"))
+            .json(&serde_json::json!({ "enabled": enable }))
             .send(),
     );
+    let label = if enable { "enabled" } else { "disabled" };
     if body.get("error").is_some() {
         ui::error(&format!(
             "Failed: {}",
             body["error"].as_str().unwrap_or("?")
         ));
     } else {
-        ui::success(&format!("Cron job {id} {endpoint}d."));
+        ui::success(&format!("Cron job {id} {label}."));
     }
 }
 

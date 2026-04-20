@@ -33,7 +33,11 @@ const MAX_TURN_MESSAGE_LEN: usize = 16_384;
 const MIN_TIMEOUT_SECS: u64 = 10;
 
 /// Maximum timeout for AgentTurn (seconds).
-const MAX_TIMEOUT_SECS: u64 = 600;
+///
+/// Raised from 600 to 1800 (30 min) to accommodate curation jobs that do
+/// batched SQL + many external API calls (Open Library, Google Books).
+/// Workflow-run cron timeout cap stays 3600 (inline at the WorkflowRun arm).
+const MAX_TIMEOUT_SECS: u64 = 1800;
 
 /// Maximum webhook URL length.
 const MAX_WEBHOOK_URL_LEN: usize = 2048;

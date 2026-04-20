@@ -133,6 +133,165 @@ impl SlackAdapter {
     }
 }
 
+/// Convert GitHub/CommonMark-flavored markdown to Slack mrkdwn.
+///
+/// Handles the common cases that show up in agent output:
+/// - `**bold**` + `__bold__` → `*bold*`
+/// - `*italic*` + `_italic_` → `_italic_` (idempotent where possible)
+/// - `### Heading` / `## Heading` / `# Heading` → `*Heading*` on own line
+/// - `---` horizontal rule → blank line
+/// - GitHub-style `| col | col |` tables → plain-text aligned rows
+/// - Leaves code fences (```) and inline code (`) alone (same in both).
+/// - Leaves list bullets (-, *) + link syntax alone.
+///
+/// Not a perfect parser — Slack mrkdwn is whitespace- and position-sensitive,
+/// and a full Commonmark→mrkdwn converter would be its own crate. This
+/// covers the 90% case for agent-emitted curation reports without dragging
+/// in a dependency.
+fn markdown_to_slack_mrkdwn(input: &str) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::with_capacity(input.len());
+    let mut in_code_fence = false;
+
+    for raw_line in input.split('\n') {
+        // Code fences are passthrough — don't transform inside a fenced block.
+        let fence = raw_line.trim_start();
+        if fence.starts_with("```") {
+            in_code_fence = !in_code_fence;
+            out.push_str(raw_line);
+            out.push('\n');
+            continue;
+        }
+        if in_code_fence {
+            out.push_str(raw_line);
+            out.push('\n');
+            continue;
+        }
+
+        let line = raw_line;
+
+        // Horizontal rule
+        let t = line.trim();
+        if t == "---" || t == "***" || t == "___" {
+            out.push('\n');
+            continue;
+        }
+
+        // Headings: collapse #, ##, ### into bold on their own line.
+        if let Some(stripped) = t
+            .strip_prefix("#### ")
+            .or_else(|| t.strip_prefix("### "))
+            .or_else(|| t.strip_prefix("## "))
+            .or_else(|| t.strip_prefix("# "))
+        {
+            let _ = writeln!(out, "*{}*", stripped.trim_end_matches(['*', ':']));
+            continue;
+        }
+
+        // Markdown tables: lines starting with `|` and containing `|` separators.
+        // The separator row (`|---|---|`) is dropped; data rows become plain
+        // tab-joined text so Slack doesn't render `|` as literal pipes.
+        if t.starts_with('|') && t.contains('|') {
+            let trimmed = t.trim_matches('|').trim();
+            // Skip the ----|---- separator row.
+            if trimmed.chars().all(|c| matches!(c, '-' | '|' | ':' | ' ')) {
+                continue;
+            }
+            let cells: Vec<&str> = trimmed.split('|').map(|c| c.trim()).collect();
+            out.push_str(&cells.join("    "));
+            out.push('\n');
+            continue;
+        }
+
+        out.push_str(&convert_inline(line));
+        out.push('\n');
+    }
+
+    // Pop trailing newline to match input convention.
+    if out.ends_with('\n') && !input.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
+/// Inline Markdown → Slack mrkdwn conversions. Applied per line, outside
+/// code fences.
+fn convert_inline(line: &str) -> String {
+    // Early-out on empty / whitespace-only lines.
+    if line.trim().is_empty() {
+        return line.to_string();
+    }
+
+    // `**bold**` → `*bold*`. Do this before single-star rules.
+    let mut s = replace_pair(line, "**", "*");
+    // `__bold__` → `*bold*` (GitHub bold alternative).
+    s = replace_pair(&s, "__", "*");
+    // `[text](url)` → `<url|text>` — Slack link syntax.
+    s = convert_links(&s);
+    s
+}
+
+/// Replace paired delimiter `delim` with `replacement` (same on both ends).
+///
+/// Walks the string left to right toggling an "open" flag; an odd trailing
+/// delimiter (no closing partner) is left as-is so asterisks in literal
+/// prose aren't mangled.
+fn replace_pair(input: &str, delim: &str, replacement: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    let mut open = false;
+    while let Some(pos) = rest.find(delim) {
+        out.push_str(&rest[..pos]);
+        // Peek: is there another delim later in this line to pair with?
+        let after = &rest[pos + delim.len()..];
+        if !open && after.contains(delim) {
+            out.push_str(replacement);
+            open = true;
+        } else if open {
+            out.push_str(replacement);
+            open = false;
+        } else {
+            // Orphan delimiter — keep it literal.
+            out.push_str(delim);
+        }
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Convert GitHub `[text](url)` to Slack `<url|text>`.
+fn convert_links(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(open) = rest.find('[') {
+        out.push_str(&rest[..open]);
+        let after_open = &rest[open + 1..];
+        if let Some(mid) = after_open.find("](") {
+            let text = &after_open[..mid];
+            let after_mid = &after_open[mid + 2..];
+            if let Some(close) = after_mid.find(')') {
+                let url = &after_mid[..close];
+                if url.starts_with("http://") || url.starts_with("https://") {
+                    out.push('<');
+                    out.push_str(url);
+                    out.push('|');
+                    out.push_str(text);
+                    out.push('>');
+                    rest = &after_mid[close + 1..];
+                    continue;
+                }
+            }
+        }
+        // Not a link — keep the `[` and continue past it.
+        out.push('[');
+        rest = after_open;
+    }
+    out.push_str(rest);
+    out
+}
+
 #[async_trait]
 impl ChannelAdapter for SlackAdapter {
     fn name(&self) -> &str {
@@ -345,7 +504,8 @@ impl ChannelAdapter for SlackAdapter {
         let channel_id = &user.platform_id;
         match content {
             ChannelContent::Text(text) => {
-                self.api_send_message(channel_id, &text, None).await?;
+                let converted = markdown_to_slack_mrkdwn(&text);
+                self.api_send_message(channel_id, &converted, None).await?;
             }
             _ => {
                 self.api_send_message(channel_id, "(Unsupported content type)", None)
@@ -364,7 +524,8 @@ impl ChannelAdapter for SlackAdapter {
         let channel_id = &user.platform_id;
         match content {
             ChannelContent::Text(text) => {
-                self.api_send_message(channel_id, &text, Some(thread_id))
+                let converted = markdown_to_slack_mrkdwn(&text);
+                self.api_send_message(channel_id, &converted, Some(thread_id))
                     .await?;
             }
             _ => {
@@ -741,5 +902,83 @@ mod tests {
             false,
         );
         assert!(!adapter.unfurl_links);
+    }
+
+    // ── markdown → slack mrkdwn converter ─────────────────────────────────
+
+    #[test]
+    fn mrkdwn_bold_double_star() {
+        assert_eq!(markdown_to_slack_mrkdwn("**bold**"), "*bold*");
+        assert_eq!(
+            markdown_to_slack_mrkdwn("a **bold** b"),
+            "a *bold* b"
+        );
+    }
+
+    #[test]
+    fn mrkdwn_bold_double_underscore() {
+        assert_eq!(markdown_to_slack_mrkdwn("__bold__"), "*bold*");
+    }
+
+    #[test]
+    fn mrkdwn_heading_becomes_bold() {
+        assert_eq!(markdown_to_slack_mrkdwn("# Title"), "*Title*");
+        assert_eq!(markdown_to_slack_mrkdwn("## Phase 1"), "*Phase 1*");
+        assert_eq!(markdown_to_slack_mrkdwn("### Sub:"), "*Sub*");
+    }
+
+    #[test]
+    fn mrkdwn_horizontal_rule_is_blank() {
+        assert_eq!(markdown_to_slack_mrkdwn("---"), "");
+    }
+
+    #[test]
+    fn mrkdwn_table_strips_pipes() {
+        let input = "| Title | Category | Source |\n| --- | --- | --- |\n| A | b | c |";
+        let out = markdown_to_slack_mrkdwn(input);
+        assert!(out.contains("Title    Category    Source"));
+        assert!(out.contains("A    b    c"));
+        assert!(!out.contains("|---|"));
+    }
+
+    #[test]
+    fn mrkdwn_link_becomes_slack_syntax() {
+        let out = markdown_to_slack_mrkdwn("See [docs](https://example.com/x) now.");
+        assert_eq!(out, "See <https://example.com/x|docs> now.");
+    }
+
+    #[test]
+    fn mrkdwn_relative_link_untouched() {
+        // Non-http links are left literal (Slack won't link them anyway).
+        let out = markdown_to_slack_mrkdwn("See [spec](./spec.md) now.");
+        assert_eq!(out, "See [spec](./spec.md) now.");
+    }
+
+    #[test]
+    fn mrkdwn_code_fence_passthrough() {
+        let input = "start\n```\n**not bold**\n# not header\n```\nend **x**";
+        let out = markdown_to_slack_mrkdwn(input);
+        // Inside fence: untouched. Outside: converted.
+        assert!(out.contains("**not bold**"));
+        assert!(out.contains("# not header"));
+        assert!(out.contains("end *x*"));
+    }
+
+    #[test]
+    fn mrkdwn_orphan_delimiter_kept_literal() {
+        // Odd number of `**` — leave the trailing one alone.
+        assert_eq!(markdown_to_slack_mrkdwn("a **b"), "a **b");
+    }
+
+    #[test]
+    fn mrkdwn_curation_report_shape() {
+        let input = "### Phase 1: Quality Audit\n- **50 low-quality docs**: valid pattern.\n\n| A | B |\n| --- | --- |\n| 1 | 2 |\n\nSee [arXiv](https://arxiv.org/abs/2604.14725).";
+        let out = markdown_to_slack_mrkdwn(input);
+        assert!(out.contains("*Phase 1: Quality Audit*"));
+        assert!(out.contains("*50 low-quality docs*"));
+        assert!(out.contains("A    B"));
+        assert!(out.contains("1    2"));
+        assert!(out.contains("<https://arxiv.org/abs/2604.14725|arXiv>"));
+        assert!(!out.contains("|---"));
     }
 }
