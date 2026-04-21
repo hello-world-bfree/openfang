@@ -61,8 +61,12 @@ impl Default for HeartbeatConfig {
     fn default() -> Self {
         Self {
             check_interval_secs: DEFAULT_CHECK_INTERVAL_SECS,
-            // 180s default: browser tasks and complex LLM calls can take 1-3 minutes
-            default_timeout_secs: 180,
+            // 1800s (30min) default: "Running" covers both actively-processing agents and
+            // idle-but-registered ones. Idle Running agents legitimately sit for a long time
+            // between incoming messages — a tighter bound flags them as Crashed and spawns
+            // pointless auto-recovery cycles every few minutes. Tasks that would benefit from
+            // a tighter bound should set `AutonomousConfig.heartbeat_interval_secs` per-agent.
+            default_timeout_secs: 1800,
             max_recovery_attempts: DEFAULT_MAX_RECOVERY_ATTEMPTS,
             recovery_cooldown_secs: DEFAULT_RECOVERY_COOLDOWN_SECS,
         }
@@ -381,17 +385,17 @@ mod tests {
         // An agent that WAS active (last_active >> created_at) but has gone
         // silent for longer than the timeout — should be flagged unresponsive.
         let registry = crate::registry::AgentRegistry::new();
-        let ten_min_ago = Utc::now() - Duration::seconds(600);
-        let five_min_ago = Utc::now() - Duration::seconds(300);
+        let two_hours_ago = Utc::now() - Duration::seconds(7200);
+        let one_hour_ago = Utc::now() - Duration::seconds(3600);
         let active_agent = make_entry(
             "active-agent",
             AgentState::Running,
-            ten_min_ago,
-            five_min_ago,
+            two_hours_ago,
+            one_hour_ago,
         );
         registry.register(active_agent).unwrap();
 
-        let config = HeartbeatConfig::default(); // timeout = 180s, inactive = ~300s
+        let config = HeartbeatConfig::default(); // timeout = 1800s, inactive = ~3600s
         let statuses = check_agents(&registry, &config);
 
         assert_eq!(statuses.len(), 1);
@@ -465,7 +469,7 @@ mod tests {
     fn test_heartbeat_config_default() {
         let config = HeartbeatConfig::default();
         assert_eq!(config.check_interval_secs, 30);
-        assert_eq!(config.default_timeout_secs, 180);
+        assert_eq!(config.default_timeout_secs, 1800);
     }
 
     #[test]

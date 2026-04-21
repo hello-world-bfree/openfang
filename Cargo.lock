@@ -4165,6 +4165,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "sha2",
  "subtle",
  "tempfile",
  "thiserror 2.0.18",
@@ -4175,6 +4176,21 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "zeroize",
+]
+
+[[package]]
+name = "openfang-mcp-bridge"
+version = "0.6.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "openfang-types",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -4246,8 +4262,10 @@ dependencies = [
  "tokio-stream",
  "tokio-test",
  "tokio-tungstenite 0.24.0",
+ "toml 0.9.12+spec-1.1.0",
  "tracing",
  "uuid",
+ "walkdir",
  "wasmtime",
  "zeroize",
 ]
@@ -4291,6 +4309,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "thiserror 2.0.18",
+ "tokio",
  "toml 0.9.12+spec-1.1.0",
  "uuid",
 ]

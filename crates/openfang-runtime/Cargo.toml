@@ -29,6 +29,7 @@ hex = { workspace = true }
 zeroize = { workspace = true }
 dashmap = { workspace = true }
 regex-lite = { workspace = true }
+walkdir = { workspace = true }
 rusqlite = { workspace = true }
 rmcp = { workspace = true }
 http = "1"
@@ -38,3 +39,4 @@ shlex = "1"
 [dev-dependencies]
 tokio-test = { workspace = true }
 tempfile = { workspace = true }
+toml = { workspace = true }

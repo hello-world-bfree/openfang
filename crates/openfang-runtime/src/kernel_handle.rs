@@ -245,17 +245,27 @@ pub trait KernelHandle: Send + Sync {
     }
 
     /// Spawn an agent with capability inheritance enforcement.
-    /// `parent_caps` are the parent's granted capabilities. The kernel MUST verify
-    /// that every capability in the child manifest is covered by `parent_caps`.
+    ///
+    /// `parent_caps` are the parent's granted capabilities. Implementations
+    /// MUST verify that every capability in the child manifest is covered by
+    /// `parent_caps` before spawning — a child may only narrow, never widen.
+    ///
+    /// The default implementation panics with `unimplemented!` so a forgotten
+    /// override in a test fake surfaces as a test-time failure instead of a
+    /// silent security regression. Production [`KernelHandle`] impls (the
+    /// real kernel) override with real enforcement.
     async fn spawn_agent_checked(
         &self,
         manifest_toml: &str,
         parent_id: Option<&str>,
         parent_caps: &[openfang_types::capability::Capability],
     ) -> Result<(String, String), String> {
-        // Default: delegate to spawn_agent (no enforcement)
-        // The kernel MUST override this with real enforcement
-        let _ = parent_caps;
-        self.spawn_agent(manifest_toml, parent_id).await
+        let _ = (manifest_toml, parent_id, parent_caps);
+        unimplemented!(
+            "KernelHandle::spawn_agent_checked must be overridden by every impl that \
+             permits agent spawning. Delegating to the unchecked spawn_agent would \
+             bypass capability inheritance and permit privilege escalation via \
+             LLM-authored child manifests."
+        )
     }
 }

@@ -1,0 +1,40 @@
+id = "docs_mcp"
+name = "Personal Docs (docs-mcp)"
+description = "Personal technical documentation server — exposes search/get-doc/list-docs over MCP so agents can query curated language + framework references. Used by the repo-digger Hand's Researcher sub-agent."
+category = "ai"
+icon = "📚"
+tags = ["documentation", "reference", "mcp", "research", "repo-digger"]
+
+[transport]
+type = "stdio"
+# SECURITY: npx -y auto-installs the named package from npm at first activation.
+# The version MUST be pinned before shipping in a signed release, otherwise a
+# typosquat or upstream account compromise gains RCE on the daemon host.
+# Pre-ship action: verify the package identity + pin an exact version tag.
+command = "npx"
+args = ["-y", "docs-mcp@TBD_PIN_BEFORE_SHIP"]
+
+[[required_env]]
+name = "DOCS_MCP_ROOT"
+label = "docs-mcp sources config path"
+help = "Path to the docs-mcp sources configuration or root directory."
+is_secret = false
+
+[health_check]
+interval_secs = 60
+unhealthy_threshold = 3
+
+setup_instructions = """
+SECURITY WARNING: This integration uses `npx -y` which auto-installs and runs
+third-party npm code. Before enabling in production:
+
+1. Verify the package identity: `npm view docs-mcp maintainers` and confirm
+   the publisher is trusted. Replace `docs-mcp@TBD_PIN_BEFORE_SHIP` in this
+   template with an explicit pinned version (e.g., `docs-mcp@1.2.3`).
+2. Set DOCS_MCP_ROOT to the path/URL where your docs sources live.
+3. Restart the daemon and activate via the MCP Extensions tab.
+
+Tools surface to agents as: mcp_docs_mcp_search, mcp_docs_mcp_get_doc,
+mcp_docs_mcp_list_docs (hyphens in the integration id are normalized to
+underscores by openfang — see crates/openfang-runtime/src/mcp.rs:408).
+"""

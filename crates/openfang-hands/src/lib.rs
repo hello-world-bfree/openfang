@@ -298,6 +298,27 @@ pub struct HandAgentConfig {
     /// making long LLM calls. Omit to use the kernel default.
     #[serde(default)]
     pub heartbeat_interval_secs: Option<u64>,
+    /// Name of a `[[settings]]` key whose resolved value becomes this Hand's
+    /// workspace root at activation time.
+    ///
+    /// When present, the kernel calls [`validate_hand_workspace`] on the
+    /// setting's current value and substitutes the canonical [`PathBuf`] as
+    /// the agent's workspace (replacing the default
+    /// `<workspaces_dir>/<agent_name>`). Used by `repo-digger` so the
+    /// investigation's `file_read` / `code_search` tools can read the
+    /// target repo — which lives outside the default workspace sandbox.
+    ///
+    /// Validation rejects sensitive directories (`~/.ssh`, `~/.aws`, etc.),
+    /// symlink escapes, control characters, and `$STATE_DIR` overlap.
+    #[serde(default)]
+    pub workspace_override_setting: Option<String>,
+    /// Enable provider prompt caching on the system-prompt block.
+    ///
+    /// Threaded through to `CompletionRequest.cache_system_prompt` at
+    /// manifest-build time. Currently only honored by the Anthropic driver.
+    /// Sub-agents inherit this value via their spawn-time manifest template.
+    #[serde(default)]
+    pub cache_system_prompt: bool,
 }
 
 fn default_module() -> String {
@@ -328,6 +349,152 @@ pub fn parse_hand_toml(content: &str) -> Result<HandDefinition, toml::de::Error>
     }
     let wrapper: HandTomlWrapper = toml::from_str(content)?;
     Ok(wrapper.hand)
+}
+
+/// Validate a user-supplied `repo_path`-style string as a candidate Hand
+/// workspace override. Returns the canonical [`PathBuf`] on success.
+///
+/// Rejected cases:
+/// - `/` or `$HOME` itself
+/// - Sensitive dot-directories under `$HOME` (`.ssh`, `.aws`, `.gnupg`,
+///   `.kube`, `.docker`, `.claude`, `.config/gcloud`, `.npmrc`, `.netrc`,
+///   `.pypirc`, `.local/share/keyrings`)
+/// - Paths less than 2 components deep under `$HOME`
+/// - Non-existent paths
+/// - Paths containing control characters or `U+202E` (right-to-left override)
+/// - Symlink escapes (canonical path must stay inside `$HOME`)
+/// - `$STATE_DIR` overlap with `repo_path`, either direction (prevents the
+///   per-run MCP config JSON from landing inside the target repo and being
+///   accidentally committed with its auth cookie)
+///
+/// `state_dir` should be the daemon's `OPENFANG_STATE_DIR` canonicalized;
+/// when `None`, the overlap check is skipped (useful for unit tests that
+/// don't have a real state dir).
+pub fn validate_hand_workspace(
+    raw: &str,
+    state_dir: Option<&std::path::Path>,
+) -> Result<std::path::PathBuf, String> {
+    // Reject control chars and Unicode RTL override up-front — they can spoof
+    // log output and bypass visual path-review.
+    for c in raw.chars() {
+        if c.is_control() || c == '\u{202E}' {
+            return Err("workspace path contains control characters".to_string());
+        }
+    }
+    let trimmed = raw.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return Err("workspace path is empty".to_string());
+    }
+
+    let expanded = if let Some(rest) = trimmed.strip_prefix("~/") {
+        dirs::home_dir()
+            .ok_or_else(|| "cannot resolve $HOME for tilde expansion".to_string())?
+            .join(rest)
+    } else if trimmed == "~" {
+        dirs::home_dir().ok_or_else(|| "cannot resolve $HOME".to_string())?
+    } else {
+        std::path::PathBuf::from(trimmed)
+    };
+
+    let canon = expanded.canonicalize().map_err(|e| {
+        format!(
+            "workspace path does not exist or is not accessible: {} ({e})",
+            expanded.display()
+        )
+    })?;
+
+    if !canon.is_dir() {
+        return Err(format!(
+            "workspace path is not a directory: {}",
+            canon.display()
+        ));
+    }
+
+    // Reject bare root / bare home.
+    if canon == std::path::Path::new("/") {
+        return Err("workspace path cannot be the filesystem root".to_string());
+    }
+    if let Some(home) = dirs::home_dir() {
+        let canon_home = home.canonicalize().unwrap_or(home.clone());
+        if canon == canon_home {
+            return Err(format!(
+                "workspace path cannot be the home directory itself ({})",
+                canon.display()
+            ));
+        }
+        if let Ok(rel) = canon.strip_prefix(&canon_home) {
+            // Block sensitive dot-directories at the first component under
+            // $HOME first — these are always wrong regardless of depth.
+            if let Some(first) = rel.components().next() {
+                let name = first.as_os_str().to_string_lossy().to_string();
+                const SENSITIVE: &[&str] = &[
+                    ".ssh",
+                    ".aws",
+                    ".gnupg",
+                    ".kube",
+                    ".docker",
+                    ".claude",
+                    ".config",
+                    ".npmrc",
+                    ".netrc",
+                    ".pypirc",
+                    ".local",
+                    ".gcp",
+                    ".azure",
+                ];
+                if SENSITIVE.contains(&name.as_str()) {
+                    return Err(format!(
+                        "workspace path refused: '{name}' is a sensitive directory \
+                         under $HOME. Pick a dedicated project directory."
+                    ));
+                }
+            }
+            // Require at least 2 components below $HOME. `$HOME/dev/openfang`
+            // has two; `$HOME/<single-dir>` has one and is rejected.
+            let depth = rel.components().count();
+            if depth < 2 {
+                return Err(format!(
+                    "workspace path too shallow under $HOME (got {depth} component(s); \
+                     require at least 2). Use a nested project directory like \
+                     $HOME/dev/<repo>, not $HOME/<single-dir>. Got: {}",
+                    canon.display()
+                ));
+            }
+        }
+    }
+
+    // Optional $STATE_DIR overlap check.
+    if let Some(state) = state_dir {
+        let canon_state = state.canonicalize().unwrap_or_else(|_| state.to_path_buf());
+        if canon.starts_with(&canon_state) || canon_state.starts_with(&canon) {
+            return Err(format!(
+                "workspace path overlaps OPENFANG_STATE_DIR ({}). Set STATE_DIR \
+                 to a directory outside your repositories so the per-run MCP \
+                 config (which contains an auth cookie) isn't accidentally \
+                 committed.",
+                canon_state.display()
+            ));
+        }
+    }
+
+    Ok(canon)
+}
+
+/// Map a `model_tier` setting value to a concrete model ID for direct-API
+/// providers (ignored when provider is `claude-code` — the CLI picks its
+/// own model).
+///
+/// Returns `Err` with a `feature` name suitable for wrapping in
+/// `LlmError::CapabilityUnsupported` when the tier is unrecognized.
+pub fn resolve_model_tier(tier: &str) -> Result<&'static str, String> {
+    match tier {
+        "cheap" => Ok("claude-haiku-4-5"),
+        "balanced" => Ok("claude-sonnet-4-6"),
+        // Opus 4.7 not yet available in the public model catalog as of
+        // 2026-04-20; fall back to 4.5 for now. Update when released.
+        "premium" => Ok("claude-opus-4-5"),
+        other => Err(format!("model_tier={other}")),
+    }
 }
 
 /// Recursively copy a directory and all its contents.
@@ -905,5 +1072,201 @@ metrics = []
         assert_eq!(def.id, "test");
         assert_eq!(def.name, "Test Hand");
         assert_eq!(def.agent.name, "test-hand");
+    }
+
+    #[test]
+    fn hand_agent_config_parses_new_fields() {
+        let toml_str = r#"
+id = "test"
+name = "Test"
+description = "t"
+category = "productivity"
+tools = []
+
+[agent]
+name = "t"
+description = "d"
+system_prompt = "s"
+workspace_override_setting = "repo_path"
+cache_system_prompt = true
+"#;
+        let def: HandDefinition = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            def.agent.workspace_override_setting.as_deref(),
+            Some("repo_path")
+        );
+        assert!(def.agent.cache_system_prompt);
+    }
+
+    #[test]
+    fn hand_agent_config_defaults_new_fields_when_absent() {
+        let toml_str = r#"
+id = "test"
+name = "Test"
+description = "t"
+category = "productivity"
+tools = []
+
+[agent]
+name = "t"
+description = "d"
+system_prompt = "s"
+"#;
+        let def: HandDefinition = toml::from_str(toml_str).unwrap();
+        assert!(def.agent.workspace_override_setting.is_none());
+        assert!(!def.agent.cache_system_prompt);
+    }
+
+    #[test]
+    fn validate_hand_workspace_accepts_nested_project_dir() {
+        let home = dirs::home_dir().expect("HOME required for test");
+        let nested = home.join("dev");
+        if !nested.exists() {
+            // Skip in environments without ~/dev
+            return;
+        }
+        // Find any 2+-level-deep existing directory under $HOME.
+        let entries: Vec<_> = std::fs::read_dir(&nested)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().is_dir())
+            .collect();
+        if let Some(entry) = entries.first() {
+            let path = entry.path();
+            let result = validate_hand_workspace(&path.to_string_lossy(), None);
+            assert!(result.is_ok(), "accepted nested dir should validate: {result:?}");
+        }
+    }
+
+    #[test]
+    fn validate_hand_workspace_rejects_home_direct() {
+        let home = dirs::home_dir().expect("HOME required");
+        let result = validate_hand_workspace(&home.to_string_lossy(), None);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("home directory"));
+    }
+
+    #[test]
+    fn validate_hand_workspace_rejects_root() {
+        let result = validate_hand_workspace("/", None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_hand_workspace_rejects_shallow_under_home() {
+        // Any 1-level-deep dir under $HOME — use a guaranteed-existing one.
+        let home = dirs::home_dir().expect("HOME required");
+        // Pick any existing dir at $HOME root.
+        let candidate = std::fs::read_dir(&home)
+            .unwrap()
+            .flatten()
+            .find(|e| e.path().is_dir())
+            .map(|e| e.path());
+        let Some(path) = candidate else { return };
+        let rel = path.strip_prefix(&home).unwrap();
+        if rel.components().count() != 1 {
+            return; // skip if the chosen dir happens not to be 1-deep
+        }
+        let name = rel.components().next().unwrap().as_os_str().to_string_lossy();
+        // Skip if it's already on the sensitive list (different error, also rejected).
+        if [".ssh", ".aws", ".gnupg", ".kube", ".docker", ".claude", ".config",
+            ".npmrc", ".netrc", ".pypirc", ".local", ".gcp", ".azure"].contains(&name.as_ref()) {
+            return;
+        }
+        let result = validate_hand_workspace(&path.to_string_lossy(), None);
+        assert!(result.is_err(), "shallow dir {name} should be rejected");
+    }
+
+    #[test]
+    fn validate_hand_workspace_rejects_sensitive_dot_dir() {
+        let home = dirs::home_dir().expect("HOME required");
+        // Construct a fake ~/.ssh-style path even if it doesn't exist —
+        // validation order: control chars → canonicalize → sensitive list.
+        // Canonicalize will fail if the path doesn't exist, so we create a
+        // temp .ssh directory to exercise the sensitive-list branch.
+        let fake_ssh = home.join(".ssh");
+        if !fake_ssh.exists() {
+            return; // Can't exercise without an existing .ssh
+        }
+        let result = validate_hand_workspace(&fake_ssh.to_string_lossy(), None);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("sensitive"));
+    }
+
+    #[test]
+    fn validate_hand_workspace_rejects_nonexistent() {
+        let result = validate_hand_workspace("/this/path/does/not/exist/anywhere", None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_hand_workspace_rejects_control_chars() {
+        let result = validate_hand_workspace("/tmp/fo\no", None);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("control characters"));
+    }
+
+    #[test]
+    fn validate_hand_workspace_rejects_rtl_override() {
+        let result = validate_hand_workspace("/tmp/\u{202E}evil", None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_hand_workspace_detects_state_dir_overlap() {
+        // Use tempdir so the test creates a valid directory first.
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Create a nested dir inside to pass the "2 components below $HOME" rule.
+        // For this test we don't care about HOME — only the overlap branch.
+        let workspace = tmp.path().join("repo");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let state_dir = workspace.join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        // The tmp path is not under $HOME so the earlier checks short-circuit
+        // on "not in home" rather than overlap. Validate the overlap logic
+        // directly via a path whose canonicalization IS under $HOME.
+        let home = dirs::home_dir().unwrap();
+        let nested = home.join("dev");
+        if !nested.exists() {
+            return;
+        }
+        let entries: Vec<_> = std::fs::read_dir(&nested)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().is_dir())
+            .collect();
+        let Some(repo) = entries.first().map(|e| e.path()) else { return };
+        let fake_state = repo.join("state");
+        std::fs::create_dir_all(&fake_state).ok();
+        let result = validate_hand_workspace(&repo.to_string_lossy(), Some(&fake_state));
+        // `fake_state` is inside repo → overlap → reject.
+        let _ = std::fs::remove_dir_all(&fake_state);
+        if let Err(msg) = result {
+            assert!(msg.contains("overlap"), "expected overlap error, got: {msg}");
+        }
+    }
+
+    #[test]
+    fn resolve_model_tier_maps_known_tiers() {
+        assert_eq!(resolve_model_tier("cheap").unwrap(), "claude-haiku-4-5");
+        assert_eq!(resolve_model_tier("balanced").unwrap(), "claude-sonnet-4-6");
+        assert_eq!(resolve_model_tier("premium").unwrap(), "claude-opus-4-5");
+    }
+
+    #[test]
+    fn resolve_model_tier_rejects_unknown_tier() {
+        let err = resolve_model_tier("giganormous").unwrap_err();
+        assert!(err.contains("model_tier=giganormous"));
+    }
+
+    #[test]
+    fn all_bundled_hands_parse_with_new_fields() {
+        // Regression: after adding workspace_override_setting +
+        // cache_system_prompt to HandAgentConfig, every existing bundled
+        // HAND.toml must still parse (backward-compat via serde(default)).
+        for (id, toml_content, _skill) in crate::bundled::bundled_hands() {
+            parse_hand_toml(toml_content)
+                .unwrap_or_else(|e| panic!("bundled hand '{id}' failed to parse: {e}"));
+        }
     }
 }

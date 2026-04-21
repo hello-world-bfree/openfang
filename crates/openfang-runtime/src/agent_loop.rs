@@ -459,6 +459,17 @@ pub async fn run_agent_loop(
             thinking: None,
             cache_system_prompt: manifest.model.cache_system_prompt,
             min_cache_tokens: min_cache_tokens_for(&manifest.model.model),
+            // Read per-agent MCP bridge config path from manifest metadata
+            // (populated by kernel::activate_hand for Hands that use
+            // workspace_override_setting under the claude-code provider).
+            // When present, the claude_code driver appends --mcp-config,
+            // --strict-mcp-config, and --disallowedTools so the CLI routes
+            // tool calls through the openfang-mcp-bridge subprocess.
+            mcp_config_path: manifest
+                .metadata
+                .get("openfang_mcp_config_path")
+                .and_then(|v| v.as_str())
+                .map(std::path::PathBuf::from),
         };
 
         // Notify phase: Thinking
@@ -1126,6 +1137,19 @@ async fn call_with_retry(
                 tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                 last_error = Some("Overloaded".to_string());
             }
+            Err(LlmError::CapabilityUnsupported { feature }) => {
+                // Driver explicitly reports a missing capability (e.g. unmapped
+                // model_tier, thinking under claude-code CLI). Do NOT retry — the
+                // condition is deterministic. Surface the feature name so the user
+                // sees what to reconfigure.
+                warn!(%feature, "LLM capability unsupported; aborting without retry");
+                if let (Some(provider), Some(cooldown)) = (provider, cooldown) {
+                    cooldown.record_failure(provider, false);
+                }
+                return Err(OpenFangError::LlmDriver(format!(
+                    "LLM capability unsupported: {feature}"
+                )));
+            }
             Err(e) => {
                 // Use classifier for smarter error handling
                 let raw_error = e.to_string();
@@ -1311,6 +1335,15 @@ async fn stream_with_retry(
                 );
                 tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                 last_error = Some("Overloaded".to_string());
+            }
+            Err(LlmError::CapabilityUnsupported { feature }) => {
+                warn!(%feature, "LLM capability unsupported (stream); aborting without retry");
+                if let (Some(provider), Some(cooldown)) = (provider, cooldown) {
+                    cooldown.record_failure(provider, false);
+                }
+                return Err(OpenFangError::LlmDriver(format!(
+                    "LLM capability unsupported: {feature}"
+                )));
             }
             Err(e) => {
                 let raw_error = e.to_string();
@@ -1669,6 +1702,17 @@ pub async fn run_agent_loop_streaming(
             thinking: None,
             cache_system_prompt: manifest.model.cache_system_prompt,
             min_cache_tokens: min_cache_tokens_for(&manifest.model.model),
+            // Read per-agent MCP bridge config path from manifest metadata
+            // (populated by kernel::activate_hand for Hands that use
+            // workspace_override_setting under the claude-code provider).
+            // When present, the claude_code driver appends --mcp-config,
+            // --strict-mcp-config, and --disallowedTools so the CLI routes
+            // tool calls through the openfang-mcp-bridge subprocess.
+            mcp_config_path: manifest
+                .metadata
+                .get("openfang_mcp_config_path")
+                .and_then(|v| v.as_str())
+                .map(std::path::PathBuf::from),
         };
 
         // Notify phase: on first iteration emit Streaming; on subsequent

@@ -1035,6 +1035,9 @@ pub struct KernelConfig {
     pub network_enabled: bool,
     /// Default LLM provider configuration.
     pub default_model: DefaultModelConfig,
+    /// Optional dedicated summarizer model for session compaction. Empty = reuse default_model.
+    #[serde(default)]
+    pub compaction: CompactionModelConfig,
     /// Memory substrate configuration.
     pub memory: MemoryConfig,
     /// Network configuration.
@@ -1374,6 +1377,7 @@ impl Default for KernelConfig {
             api_listen: "127.0.0.1:50051".to_string(),
             network_enabled: false,
             default_model: DefaultModelConfig::default(),
+            compaction: CompactionModelConfig::default(),
             memory: MemoryConfig::default(),
             network: NetworkConfig::default(),
             channels: ChannelsConfig::default(),
@@ -1427,6 +1431,15 @@ impl KernelConfig {
             .unwrap_or_else(|| self.home_dir.join("workspaces"))
     }
 
+    /// Resolved runtime state directory — per-run transient files the daemon
+    /// manages (MCP bridge config JSONs, UDS sockets, lock files). Distinct
+    /// from `workspaces_dir` so a repo-digger workspace override can't engulf
+    /// the daemon's own state (which would leak per-run auth cookies into a
+    /// git-tracked dir if the user committed it).
+    pub fn effective_state_dir(&self) -> PathBuf {
+        self.home_dir.join("state")
+    }
+
     /// Resolve the API key env var name for a provider.
     ///
     /// Checks: 1) explicit `provider_api_keys` mapping, 2) `auth_profiles` first entry,
@@ -1459,6 +1472,7 @@ impl std::fmt::Debug for KernelConfig {
             .field("api_listen", &self.api_listen)
             .field("network_enabled", &self.network_enabled)
             .field("default_model", &self.default_model)
+            .field("compaction", &self.compaction)
             .field("memory", &self.memory)
             .field("network", &self.network)
             .field("channels", &self.channels)
@@ -1573,6 +1587,30 @@ impl Default for DefaultModelConfig {
             base_url: None,
         }
     }
+}
+
+/// Dedicated model for session compaction / summarization.
+///
+/// The default agent driver is often an agentic CLI (e.g. `claude-code`) that
+/// does not behave as a general-purpose completion endpoint and can echo its
+/// own system prompt back as output. When that echoed string ends up in the
+/// canonical summary it makes the next agent turn regurgitate the prompt
+/// instead of answering the user. Pinning a dedicated REST-API model here
+/// prevents that failure mode.
+///
+/// All fields optional: if `provider` is empty the kernel falls back to
+/// `default_model` for compaction (legacy behavior).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CompactionModelConfig {
+    /// Provider name (e.g., "anthropic", "openai", "groq"). Empty = use default_model.
+    pub provider: String,
+    /// Model identifier.
+    pub model: String,
+    /// Environment variable name for the API key.
+    pub api_key_env: String,
+    /// Optional base URL override.
+    pub base_url: Option<String>,
 }
 
 /// Memory substrate configuration.

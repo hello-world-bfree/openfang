@@ -23,6 +23,9 @@ struct ManagedProcess {
     stderr_buf: Arc<Mutex<Vec<String>>>,
     /// The child process handle.
     child: tokio::process::Child,
+    /// Handles to the background stdout/stderr reader tasks. Aborted in
+    /// `kill()` so readers don't linger after the child exits.
+    reader_handles: Vec<tokio::task::JoinHandle<()>>,
     /// Agent that owns this process.
     agent_id: String,
     /// Command that was started.
@@ -98,11 +101,13 @@ impl ProcessManager {
 
         let stdout_buf = Arc::new(Mutex::new(Vec::<String>::new()));
         let stderr_buf = Arc::new(Mutex::new(Vec::<String>::new()));
+        let mut reader_handles = Vec::new();
 
-        // Spawn background readers for stdout/stderr
+        // Spawn background readers for stdout/stderr and retain their
+        // JoinHandles so `kill()` can abort them on termination.
         if let Some(out) = stdout {
             let buf = stdout_buf.clone();
-            tokio::spawn(async move {
+            reader_handles.push(tokio::spawn(async move {
                 let reader = BufReader::new(out);
                 let mut lines = reader.lines();
                 while let Ok(Some(line)) = lines.next_line().await {
@@ -113,12 +118,12 @@ impl ProcessManager {
                     }
                     b.push(line);
                 }
-            });
+            }));
         }
 
         if let Some(err) = stderr {
             let buf = stderr_buf.clone();
-            tokio::spawn(async move {
+            reader_handles.push(tokio::spawn(async move {
                 let reader = BufReader::new(err);
                 let mut lines = reader.lines();
                 while let Ok(Some(line)) = lines.next_line().await {
@@ -128,7 +133,7 @@ impl ProcessManager {
                     }
                     b.push(line);
                 }
-            });
+            }));
         }
 
         let id = format!(
@@ -152,6 +157,7 @@ impl ProcessManager {
                 stdout_buf,
                 stderr_buf,
                 child,
+                reader_handles,
                 agent_id: agent_id.to_string(),
                 command: cmd_display,
                 started_at: std::time::Instant::now(),
@@ -201,6 +207,11 @@ impl ProcessManager {
     }
 
     /// Kill a process.
+    ///
+    /// On Unix, `kill()` alone leaves a zombie until the parent waits. This
+    /// function always calls `wait()` after the kill so the daemon doesn't
+    /// leak zombies across investigations. Background stdout/stderr reader
+    /// tasks are also aborted so they don't linger holding pipe ends open.
     pub async fn kill(&self, process_id: &str) -> Result<(), String> {
         let (_, mut proc) = self
             .processes
@@ -212,6 +223,15 @@ impl ProcessManager {
             let _ = crate::subprocess_sandbox::kill_process_tree(pid, 3000).await;
         }
         let _ = proc.child.kill().await;
+        // Reap the zombie — Unix requires wait() after kill() or the PID
+        // entry persists in the kernel process table until the daemon exits.
+        let _ = proc.child.wait().await;
+        // Abort reader tasks. They'd exit on their own once the pipe EOFs,
+        // but explicit abort is faster and avoids a brief window where stale
+        // JoinHandles accumulate.
+        for h in proc.reader_handles {
+            h.abort();
+        }
         Ok(())
     }
 
@@ -329,5 +349,52 @@ mod tests {
         let pm = ProcessManager::default();
         assert_eq!(pm.max_per_agent, 5);
         assert_eq!(pm.count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_kill_waits_to_reap_zombie() {
+        // Spawn a long-sleeping child, kill it, and verify kill() returned
+        // only after wait() completed (no zombie left behind). We can detect
+        // zombie presence on Linux via /proc/<pid>/status — skipped on macOS
+        // where /proc is absent; we rely on kill+wait completing without
+        // timing out as a proxy for "wait was actually called."
+        let pm = ProcessManager::new(5);
+        let id = pm
+            .start("agent-z", "sleep", &["30".to_string()])
+            .await
+            .unwrap();
+        // Wait long enough for the subprocess to actually be running before
+        // we kill it, so the race between spawn and kill doesn't mask the
+        // wait() path.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            pm.kill(&id),
+        )
+        .await;
+        assert!(result.is_ok(), "kill() must complete within 5s (reaped via wait)");
+        assert_eq!(pm.count(), 0, "killed process must be removed from the registry");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_kill_aborts_reader_tasks() {
+        // Start a process that would produce output forever, then kill it.
+        // The reader tasks must be aborted — if they weren't, nothing would
+        // break in this test directly, but the cleanup path has no other
+        // observable signal. Smoke test: kill returns Ok without hanging.
+        let pm = ProcessManager::new(5);
+        let id = pm
+            .start("agent-a", "yes", &["hello".to_string()])
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            pm.kill(&id),
+        )
+        .await;
+        assert!(result.is_ok(), "kill() of a chatty process must complete promptly");
     }
 }

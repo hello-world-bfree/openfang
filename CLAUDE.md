@@ -10,7 +10,7 @@ OpenFang is an open-source Agent Operating System written in Rust (14 crates).
 After every feature implementation, run ALL THREE checks:
 ```bash
 cargo build --workspace --lib          # Must compile (use --lib if exe is locked)
-cargo test --workspace                 # All tests must pass (currently 1744+)
+cargo test --workspace                 # All tests must pass (2500+ as of 2026-04-20; don't bake a number, check for zero failures)
 cargo clippy --workspace --all-targets -- -D warnings  # Zero warnings
 ```
 
@@ -116,7 +116,7 @@ taskkill //PID <pid> //F
 
 ## Common Gotchas
 - `openfang.exe` may be locked if daemon is running — use `--lib` flag or kill daemon first
-- `PeerRegistry` is `Option<PeerRegistry>` on kernel but `Option<Arc<PeerRegistry>>` on `AppState` — wrap with `.as_ref().map(|r| Arc::new(r.clone()))`
+- `PeerRegistry` on kernel is `OnceLock<PeerRegistry>`, on `AppState` is `Option<Arc<PeerRegistry>>` — construct with `kernel.peer_registry.get().map(|r| Arc::new(r.clone()))` (see `server.rs:48`)
 - Config fields added to `KernelConfig` struct MUST also be added to the `Default` impl or build fails
 - `AgentLoopResult` field is `.response` not `.response_text`
 - CLI command to start daemon is `start` not `daemon`

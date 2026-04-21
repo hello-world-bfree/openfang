@@ -843,6 +843,7 @@ mod tests {
             thinking: None,
             cache_system_prompt,
             min_cache_tokens,
+            mcp_config_path: None,
         }
     }
 

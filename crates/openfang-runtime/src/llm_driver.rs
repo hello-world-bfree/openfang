@@ -46,10 +46,19 @@ pub enum LlmError {
     /// Model not found.
     #[error("Model not found: {0}")]
     ModelNotFound(String),
+    /// Driver does not support a requested capability (e.g. extended thinking
+    /// under the Claude Code CLI, or an unmapped `model_tier` value). The
+    /// caller should surface the `feature` name in a user-visible error and
+    /// NOT retry.
+    #[error("LLM driver capability unsupported: {feature}")]
+    CapabilityUnsupported {
+        /// Machine-readable feature name (e.g. "thinking", "model_tier=foo").
+        feature: String,
+    },
 }
 
 /// A request to an LLM for completion.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CompletionRequest {
     /// Model identifier.
     pub model: String,
@@ -82,6 +91,18 @@ pub struct CompletionRequest {
     ///
     /// `0` disables the threshold check (not recommended in production).
     pub min_cache_tokens: u32,
+    /// Per-request path to an MCP config JSON file.
+    ///
+    /// When `Some`, the `claude_code` driver passes `--mcp-config <path>
+    /// --strict-mcp-config --disallowedTools 'Bash,Write,WebFetch,WebSearch,
+    /// Read,Glob,Grep,Task'` to the `claude` subprocess so Claude Code's
+    /// internal tool loop routes tool calls through the openfang-mcp-bridge
+    /// rather than its built-in tool set. The kernel writes this file per
+    /// agent at `$STATE_DIR/repo-digger/mcp-<agent_id>.json` and passes the
+    /// path here when spawning the agent's LLM call.
+    ///
+    /// Other drivers ignore this field.
+    pub mcp_config_path: Option<std::path::PathBuf>,
 }
 
 /// A response from an LLM completion.
@@ -326,6 +347,7 @@ mod tests {
             thinking: None,
             cache_system_prompt: false,
             min_cache_tokens: 0,
+            mcp_config_path: None,
         };
 
         let response = driver.stream(request, tx).await.unwrap();

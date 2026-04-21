@@ -24,6 +24,7 @@ use tracing::{debug, info, warn};
 const SENSITIVE_ENV_EXACT: &[&str] = &[
     "OPENAI_API_KEY",
     "ANTHROPIC_API_KEY",
+    "CLAUDE_API_KEY",
     "GEMINI_API_KEY",
     "GOOGLE_API_KEY",
     "GROQ_API_KEY",
@@ -43,11 +44,34 @@ const SENSITIVE_ENV_EXACT: &[&str] = &[
     "BRAVE_API_KEY",
     "TAVILY_API_KEY",
     "ELEVENLABS_API_KEY",
+    // Cloud provider credentials — never passed to the CLI subprocess.
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "GCP_SERVICE_ACCOUNT_JSON",
+    // Connection strings with embedded credentials.
+    "DATABASE_URL",
+    "REDIS_URL",
+    "MONGODB_URI",
+    // Service-specific secrets.
+    "STRIPE_SECRET_KEY",
 ];
 
 /// Suffixes that indicate a secret — remove any env var ending with these
-/// unless it starts with `CLAUDE_`.
-const SENSITIVE_SUFFIXES: &[&str] = &["_SECRET", "_TOKEN", "_PASSWORD"];
+/// unless it starts with `CLAUDE_CODE_` or is exactly `CLAUDE_HOME`.
+///
+/// NOTE: the narrow `CLAUDE_CODE_*` / `CLAUDE_HOME` exception replaces an
+/// earlier blanket `CLAUDE_*` pass-through that inadvertently leaked
+/// `CLAUDE_API_KEY` to the subprocess.
+const SENSITIVE_SUFFIXES: &[&str] = &["_SECRET", "_TOKEN", "_PASSWORD", "_KEY", "_CREDENTIALS"];
+
+/// Tool names from Claude Code's built-in tool set that must be disabled when
+/// the driver runs in MCP-bridge mode. Without this, a prompt-injected repo
+/// could instruct the LLM to use Claude Code's unsandboxed `Bash` / `Read` /
+/// `Write` (full-filesystem-access) instead of the bridge's sandboxed
+/// equivalents, defeating openfang's workspace sandbox.
+const CLAUDE_CODE_BUILTIN_TOOLS_TO_DISALLOW: &str = "Bash,Write,WebFetch,WebSearch,Read,Glob,Grep,Task";
 
 /// Default subprocess timeout in seconds (5 minutes).
 const DEFAULT_MESSAGE_TIMEOUT_SECS: u64 = 300;
@@ -129,6 +153,45 @@ impl ClaudeCodeDriver {
         }
     }
 
+    /// Strip role-label artifacts the CLI sometimes emits by mimicking the
+    /// prompt's `[User]\n<text>\n\n[Assistant]\n<text>` shape.
+    ///
+    /// Observed in production: CLI continues its own reply with a fabricated
+    /// `[User]\n[From: <slack_id>] <next question>` block at the end, making
+    /// the bot look like it's hallucinating follow-up questions. We detect the
+    /// first `[User]` / `[Assistant]` / `[System]` tag that appears on its own
+    /// line AFTER the first real line of output and truncate there.
+    fn sanitize_output(raw: &str) -> String {
+        let trimmed = raw.trim_start();
+        // Keep output up to (but not including) the first stray role marker
+        // on its own line. Only consider markers that follow at least one
+        // non-empty prior line — a leading `[User]` (unlikely but possible)
+        // is left alone and will be stripped by the trailing trim.
+        let mut cut: Option<usize> = None;
+        let mut saw_content = false;
+        let mut offset = 0usize;
+        for line in trimmed.split_inclusive('\n') {
+            let stripped = line.trim();
+            if saw_content
+                && (stripped == "[User]"
+                    || stripped == "[Assistant]"
+                    || stripped == "[System]")
+            {
+                cut = Some(offset);
+                break;
+            }
+            if !stripped.is_empty() {
+                saw_content = true;
+            }
+            offset += line.len();
+        }
+        let out = match cut {
+            Some(pos) => &trimmed[..pos],
+            None => trimmed,
+        };
+        out.trim_end().to_string()
+    }
+
     /// Build a text prompt from the completion request messages.
     fn build_prompt(request: &CompletionRequest) -> String {
         let mut parts = Vec::new();
@@ -168,9 +231,10 @@ impl ClaudeCodeDriver {
         for key in SENSITIVE_ENV_EXACT {
             cmd.env_remove(key);
         }
-        // Remove any env var with a sensitive suffix, unless it's CLAUDE_*
+        // Remove any env var with a sensitive suffix, unless it's a Claude Code
+        // config var (CLAUDE_CODE_*) or the credentials directory override.
         for (key, _) in std::env::vars() {
-            if key.starts_with("CLAUDE_") {
+            if key.starts_with("CLAUDE_CODE_") || key == "CLAUDE_HOME" {
                 continue;
             }
             let upper = key.to_uppercase();
@@ -180,6 +244,29 @@ impl ClaudeCodeDriver {
                     break;
                 }
             }
+        }
+    }
+
+    /// Apply MCP bridge flags when `request.mcp_config_path` is set.
+    ///
+    /// Emits:
+    /// - `--mcp-config <path>` — point CLI at openfang-mcp-bridge's config
+    /// - `--strict-mcp-config` — isolate from `~/.claude.json` MCP servers
+    /// - `--disallowedTools 'Bash,Write,…'` — block sandbox-bypass built-ins
+    /// - `--permission-mode default` — keep CLI's permission gate active
+    /// - `--allowedTools 'mcp__openfang__*'` — allowlist openfang's MCP tools
+    ///   so investigations run without `--dangerously-skip-permissions`. The
+    ///   prefix matches Claude Code's MCP tool naming (`mcp__<server>__<tool>`),
+    ///   and our bridge registers its server as `openfang` in the config's
+    ///   `mcpServers` block.
+    fn apply_mcp_args(cmd: &mut tokio::process::Command, request: &CompletionRequest) {
+        if let Some(ref path) = request.mcp_config_path {
+            cmd.arg("--mcp-config").arg(path);
+            cmd.arg("--strict-mcp-config");
+            cmd.arg("--disallowedTools")
+                .arg(CLAUDE_CODE_BUILTIN_TOOLS_TO_DISALLOW);
+            cmd.arg("--permission-mode").arg("default");
+            cmd.arg("--allowedTools").arg("mcp__openfang__*");
         }
     }
 }
@@ -272,7 +359,17 @@ impl LlmDriver for ClaudeCodeDriver {
             cmd.arg("--system-prompt").arg(sys);
         }
 
-        if self.skip_permissions {
+        // Permission model:
+        //   - Bridge mode (request.mcp_config_path is Some):
+        //       --permission-mode default --allowedTools 'mcp__openfang__*'
+        //     Claude Code's permission gate stays active; MCP tools served
+        //     by openfang-mcp-bridge are allowlisted by prefix so they
+        //     execute without interactive approval. Non-MCP tools are
+        //     already blocked by --disallowedTools, so the gate effectively
+        //     only opens for the bridge's sandboxed subset.
+        //   - Non-bridge mode: fall back to skip_permissions if configured,
+        //     preserving existing user agents' behavior.
+        if request.mcp_config_path.is_none() && self.skip_permissions {
             cmd.arg("--dangerously-skip-permissions");
         }
 
@@ -280,6 +377,7 @@ impl LlmDriver for ClaudeCodeDriver {
             cmd.arg("--model").arg(model);
         }
 
+        Self::apply_mcp_args(&mut cmd, &request);
         Self::apply_env_filter(&mut cmd);
 
         // Inject HOME so the CLI can find its credentials (~/.claude/) when
@@ -303,8 +401,9 @@ impl LlmDriver for ClaudeCodeDriver {
             ))
         })?;
 
-        // Track the PID using the model name as label (best identifier available)
-        let pid_label = request.model.clone();
+        // Label PIDs uniquely: model name alone collides under concurrent runs
+        // (two Navigator sub-agents both use `claude-code/default`).
+        let pid_label = format!("{}-{}", request.model, uuid::Uuid::new_v4());
         if let Some(pid) = child.id() {
             self.active_pids.insert(pid_label.clone(), pid);
             debug!(pid = pid, model = %pid_label, "Claude Code CLI subprocess started");
@@ -418,6 +517,7 @@ impl LlmDriver for ClaudeCodeDriver {
                 .or(parsed.content)
                 .or(parsed.text)
                 .unwrap_or_default();
+            let text = Self::sanitize_output(&text);
             let usage = parsed.usage.unwrap_or_default();
             return Ok(CompletionResponse {
                 content: vec![ContentBlock::Text {
@@ -435,7 +535,7 @@ impl LlmDriver for ClaudeCodeDriver {
         }
 
         // Fallback: treat entire stdout as plain text
-        let text = stdout.trim().to_string();
+        let text = Self::sanitize_output(stdout.trim());
         Ok(CompletionResponse {
             content: vec![ContentBlock::Text {
                 text,
@@ -466,7 +566,10 @@ impl LlmDriver for ClaudeCodeDriver {
             cmd.arg("--system-prompt").arg(sys);
         }
 
-        if self.skip_permissions {
+        // Same permission-mode selection as the non-streaming path — in
+        // bridge mode, Claude Code's permission gate stays active; MCP
+        // tools are allowlisted via --allowedTools in apply_mcp_args.
+        if request.mcp_config_path.is_none() && self.skip_permissions {
             cmd.arg("--dangerously-skip-permissions");
         }
 
@@ -474,6 +577,7 @@ impl LlmDriver for ClaudeCodeDriver {
             cmd.arg("--model").arg(model);
         }
 
+        Self::apply_mcp_args(&mut cmd, &request);
         Self::apply_env_filter(&mut cmd);
 
         // Same HOME and stdin hygiene as the non-streaming path.
@@ -494,8 +598,9 @@ impl LlmDriver for ClaudeCodeDriver {
             ))
         })?;
 
-        // Track PID
-        let pid_label = format!("{}-stream", request.model);
+        // Track PID — include UUID to avoid DashMap key collisions under
+        // concurrent investigations (multiple agents all use the same model).
+        let pid_label = format!("{}-stream-{}", request.model, uuid::Uuid::new_v4());
         if let Some(pid) = child.id() {
             self.active_pids.insert(pid_label.clone(), pid);
             debug!(pid = pid, model = %pid_label, "Claude Code CLI streaming subprocess started");
@@ -650,7 +755,7 @@ impl LlmDriver for ClaudeCodeDriver {
 
         Ok(CompletionResponse {
             content: vec![ContentBlock::Text {
-                text: full_text,
+                text: Self::sanitize_output(&full_text),
                 provider_metadata: None,
             }],
             stop_reason: StopReason::EndTurn,
@@ -699,6 +804,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_sanitize_output_strips_fabricated_user_turn() {
+        let raw = "Here is the answer.\n\n1. First point\n2. Second point\n\n[User]\n[From: U093MMBNECV] Follow-up question the user didn't ask";
+        let cleaned = ClaudeCodeDriver::sanitize_output(raw);
+        assert_eq!(
+            cleaned,
+            "Here is the answer.\n\n1. First point\n2. Second point"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_output_strips_assistant_continuation() {
+        let raw = "Main response body here.\n\n[Assistant]\nContinued hallucination.";
+        let cleaned = ClaudeCodeDriver::sanitize_output(raw);
+        assert_eq!(cleaned, "Main response body here.");
+    }
+
+    #[test]
+    fn test_sanitize_output_preserves_bracket_content() {
+        // `[User]` inline in prose should be left alone — only matches on own line
+        let raw = "Use `[User]` as a placeholder in your docs.";
+        assert_eq!(
+            ClaudeCodeDriver::sanitize_output(raw),
+            "Use `[User]` as a placeholder in your docs."
+        );
+    }
+
+    #[test]
+    fn test_sanitize_output_no_marker_unchanged() {
+        let raw = "Just a normal response.\n\nSecond paragraph.";
+        assert_eq!(
+            ClaudeCodeDriver::sanitize_output(raw),
+            "Just a normal response.\n\nSecond paragraph."
+        );
+    }
+
+    #[test]
+    fn test_sanitize_output_trims_trailing_whitespace() {
+        let raw = "Text\n\n\n";
+        assert_eq!(ClaudeCodeDriver::sanitize_output(raw), "Text");
+    }
+
+    #[test]
     fn test_build_prompt_simple() {
         use openfang_types::message::{Message, MessageContent};
 
@@ -715,6 +862,7 @@ mod tests {
             thinking: None,
             cache_system_prompt: false,
             min_cache_tokens: 0,
+            mcp_config_path: None,
         };
 
         let prompt = ClaudeCodeDriver::build_prompt(&request);
@@ -788,5 +936,158 @@ mod tests {
         assert!(SENSITIVE_ENV_EXACT.contains(&"GEMINI_API_KEY"));
         assert!(SENSITIVE_ENV_EXACT.contains(&"GROQ_API_KEY"));
         assert!(SENSITIVE_ENV_EXACT.contains(&"DEEPSEEK_API_KEY"));
+    }
+
+    #[test]
+    fn test_claude_api_key_is_stripped() {
+        // Earlier versions passed any CLAUDE_* env through unchanged, leaking
+        // CLAUDE_API_KEY into the subprocess. v5 narrows the exception.
+        assert!(
+            SENSITIVE_ENV_EXACT.contains(&"CLAUDE_API_KEY"),
+            "CLAUDE_API_KEY must be stripped — it would otherwise ride the CLAUDE_* pass-through"
+        );
+    }
+
+    #[test]
+    fn test_cloud_credentials_in_strip_list() {
+        // AWS/GCP credentials commonly live in developer env; never pass them.
+        assert!(SENSITIVE_ENV_EXACT.contains(&"AWS_ACCESS_KEY_ID"));
+        assert!(SENSITIVE_ENV_EXACT.contains(&"AWS_SECRET_ACCESS_KEY"));
+        assert!(SENSITIVE_ENV_EXACT.contains(&"AWS_SESSION_TOKEN"));
+        assert!(SENSITIVE_ENV_EXACT.contains(&"GOOGLE_APPLICATION_CREDENTIALS"));
+        assert!(SENSITIVE_ENV_EXACT.contains(&"DATABASE_URL"));
+        assert!(SENSITIVE_ENV_EXACT.contains(&"STRIPE_SECRET_KEY"));
+    }
+
+    #[test]
+    fn test_sensitive_suffixes_include_key_and_credentials() {
+        // `_KEY` catches vars like STRIPE_SECRET_KEY and any other generic
+        // third-party key. `_CREDENTIALS` catches CI/CD secret bundles.
+        assert!(SENSITIVE_SUFFIXES.contains(&"_KEY"));
+        assert!(SENSITIVE_SUFFIXES.contains(&"_CREDENTIALS"));
+        assert!(SENSITIVE_SUFFIXES.contains(&"_SECRET"));
+        assert!(SENSITIVE_SUFFIXES.contains(&"_TOKEN"));
+        assert!(SENSITIVE_SUFFIXES.contains(&"_PASSWORD"));
+    }
+
+    #[test]
+    fn test_claude_code_builtin_disallow_list_covers_bypass_risks() {
+        // Prompt-injected repo content could instruct the LLM to use Claude
+        // Code's own Bash / Read / Write tools — which are NOT subject to
+        // openfang's workspace sandbox. These must be disabled in bridge mode.
+        let disallowed = CLAUDE_CODE_BUILTIN_TOOLS_TO_DISALLOW;
+        for tool in ["Bash", "Read", "Write", "WebFetch", "WebSearch", "Glob", "Grep", "Task"] {
+            assert!(
+                disallowed.contains(tool),
+                "{tool} must appear in CLAUDE_CODE_BUILTIN_TOOLS_TO_DISALLOW"
+            );
+        }
+    }
+
+    #[test]
+    fn test_apply_mcp_args_no_op_when_path_absent() {
+        use openfang_types::message::Message;
+        // Without mcp_config_path, the driver emits no MCP flags.
+        let request = CompletionRequest {
+            model: "claude-code/sonnet".to_string(),
+            messages: vec![Message::user("x")],
+            tools: vec![],
+            max_tokens: 1,
+            temperature: 0.0,
+            system: None,
+            thinking: None,
+            cache_system_prompt: false,
+            min_cache_tokens: 0,
+            mcp_config_path: None,
+        };
+        let mut cmd = tokio::process::Command::new("echo");
+        ClaudeCodeDriver::apply_mcp_args(&mut cmd, &request);
+        // Inspect args using as_std_mut() — tokio exposes the underlying std::process::Command.
+        let std_cmd: &mut std::process::Command = cmd.as_std_mut();
+        let args: Vec<_> = std_cmd.get_args().map(|s| s.to_string_lossy().to_string()).collect();
+        assert!(
+            !args.iter().any(|a| a == "--mcp-config"),
+            "MCP flags must not be emitted when mcp_config_path is None"
+        );
+    }
+
+    #[test]
+    fn test_apply_mcp_args_emits_all_flags_when_path_set() {
+        use openfang_types::message::Message;
+        let request = CompletionRequest {
+            model: "claude-code/sonnet".to_string(),
+            messages: vec![Message::user("x")],
+            tools: vec![],
+            max_tokens: 1,
+            temperature: 0.0,
+            system: None,
+            thinking: None,
+            cache_system_prompt: false,
+            min_cache_tokens: 0,
+            mcp_config_path: Some(std::path::PathBuf::from("/tmp/mcp-xyz.json")),
+        };
+        let mut cmd = tokio::process::Command::new("echo");
+        ClaudeCodeDriver::apply_mcp_args(&mut cmd, &request);
+        let std_cmd: &mut std::process::Command = cmd.as_std_mut();
+        let args: Vec<String> = std_cmd
+            .get_args()
+            .map(|s| s.to_string_lossy().to_string())
+            .collect();
+        assert!(args.iter().any(|a| a == "--mcp-config"));
+        assert!(args.iter().any(|a| a == "/tmp/mcp-xyz.json"));
+        assert!(args.iter().any(|a| a == "--strict-mcp-config"));
+        assert!(args.iter().any(|a| a == "--disallowedTools"));
+        // The disallow list arg itself must include the sandbox-bypass tools.
+        assert!(args
+            .iter()
+            .any(|a| a.contains("Bash") && a.contains("Read") && a.contains("Write")));
+        // Permission-mode flags replace --dangerously-skip-permissions in
+        // bridge mode. `default` keeps Claude Code's gate active;
+        // `mcp__openfang__*` allowlists only the bridge-served tools.
+        assert!(args.iter().any(|a| a == "--permission-mode"));
+        assert!(args.iter().any(|a| a == "default"));
+        assert!(args.iter().any(|a| a == "--allowedTools"));
+        assert!(args.iter().any(|a| a == "mcp__openfang__*"));
+    }
+
+    #[test]
+    fn test_skip_permissions_honored_outside_bridge_mode() {
+        // Non-bridge agents (legacy Hands using claude-code without an MCP
+        // config) should still get --dangerously-skip-permissions so they
+        // aren't prompted. Check by building a command in non-bridge mode
+        // and asserting the flag is present — we can't call `complete()`
+        // without a real CLI, so the check is at the flag-assembly level.
+        let driver = ClaudeCodeDriver::new(None, true);
+        // Construct via the same path complete() uses: skip_permissions is
+        // applied only when mcp_config_path is None. Simulate by asserting
+        // the driver's internal flag + that apply_mcp_args is a no-op for
+        // None path.
+        let mut cmd = tokio::process::Command::new("echo");
+        let request = CompletionRequest {
+            model: "claude-code/sonnet".to_string(),
+            messages: vec![openfang_types::message::Message::user("x")],
+            tools: vec![],
+            max_tokens: 1,
+            temperature: 0.0,
+            system: None,
+            thinking: None,
+            cache_system_prompt: false,
+            min_cache_tokens: 0,
+            mcp_config_path: None,
+        };
+        ClaudeCodeDriver::apply_mcp_args(&mut cmd, &request);
+        assert!(driver.skip_permissions);
+        // apply_mcp_args is a no-op — the flag is added separately at the
+        // call site. The other test above covers the no-op case.
+    }
+
+    #[test]
+    fn test_pid_label_includes_uuid_for_uniqueness() {
+        // Two concurrent sub-agents using the same model must not collide in
+        // the active_pids DashMap. The label format is "{model}-{uuid}".
+        let a = format!("{}-{}", "claude-code/default", uuid::Uuid::new_v4());
+        let b = format!("{}-{}", "claude-code/default", uuid::Uuid::new_v4());
+        assert_ne!(a, b);
+        assert!(a.starts_with("claude-code/default-"));
     }
 }

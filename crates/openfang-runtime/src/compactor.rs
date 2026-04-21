@@ -414,6 +414,33 @@ fn build_conversation_text(messages: &[Message], config: &CompactionConfig) -> S
     conversation_text
 }
 
+/// Reject outputs that clearly aren't a real summary — most commonly
+/// the summarizer driver echoing back its own system/user prompt verbatim.
+/// Seen with Claude Code CLI: it returns the `--system-prompt` string as
+/// the completion, which then gets stored as canonical summary and causes
+/// the agent to regurgitate it instead of answering the user.
+fn is_plausible_summary(summary: &str) -> bool {
+    let trimmed = summary.trim();
+    if trimmed.len() < 20 {
+        return false;
+    }
+    let lower = trimmed.to_lowercase();
+    const ECHO_MARKERS: &[&str] = &[
+        "produce a concise summary that captures",
+        "you are a conversation summarizer",
+        "summarize the following conversation preserving",
+        "merge these",
+        "output only the summary",
+        "output only the merged summary",
+    ];
+    for marker in ECHO_MARKERS {
+        if lower.contains(marker) {
+            return false;
+        }
+    }
+    true
+}
+
 /// Summarize a slice of messages using the LLM.
 ///
 /// Builds the conversation text, applies chunking limits, and calls the LLM
@@ -453,6 +480,8 @@ async fn summarize_messages(
         // Summarizer requests are short single-turn; caching makes no sense here.
         cache_system_prompt: false,
         min_cache_tokens: 0,
+        // Compactor doesn't need MCP bridge tools.
+        mcp_config_path: None,
         model: model.to_string(),
         messages: vec![Message {
             role: Role::User,
@@ -481,6 +510,18 @@ async fn summarize_messages(
                 if summary.is_empty() {
                     last_error = "LLM returned empty summary".to_string();
                     warn!(attempt, "Empty summary from LLM, retrying");
+                    continue;
+                }
+                if !is_plausible_summary(&summary) {
+                    last_error = format!(
+                        "LLM returned implausible summary (likely prompt echo): {}",
+                        safe_truncate_str(&summary, 120)
+                    );
+                    warn!(
+                        attempt,
+                        preview = %safe_truncate_str(&summary, 120),
+                        "Summary looks like a prompt echo, retrying"
+                    );
                     continue;
                 }
                 return Ok(summary);
@@ -573,6 +614,7 @@ async fn summarize_in_chunks(
     let merge_request = CompletionRequest {
         cache_system_prompt: false,
         min_cache_tokens: 0,
+        mcp_config_path: None,
         model: model.to_string(),
         messages: vec![Message {
             role: Role::User,
@@ -595,8 +637,12 @@ async fn summarize_in_chunks(
     match driver.complete(merge_request).await {
         Ok(response) => {
             let merged = response.text();
-            if merged.is_empty() {
+            if merged.is_empty() || !is_plausible_summary(&merged) {
                 // Fall back to concatenating the per-chunk summaries
+                warn!(
+                    preview = %safe_truncate_str(&merged, 120),
+                    "Merge returned empty or implausible summary, concatenating chunks"
+                );
                 Ok(summaries.join("\n\n"))
             } else {
                 Ok(merged)
@@ -891,7 +937,7 @@ mod tests {
                 );
                 Ok(CompletionResponse {
                     content: vec![ContentBlock::Text {
-                        text: "Summary with tools".to_string(),
+                        text: "User asked about tools and got results back.".to_string(),
                         provider_metadata: None,
                     }],
                     stop_reason: openfang_types::message::StopReason::EndTurn,
@@ -1182,7 +1228,9 @@ mod tests {
                 let n = CALL_COUNT.fetch_add(1, Ordering::SeqCst);
                 Ok(CompletionResponse {
                     content: vec![ContentBlock::Text {
-                        text: format!("Chunk summary {n}"),
+                        text: format!(
+                            "Partial summary {n}: user and assistant discussed topic {n}."
+                        ),
                         provider_metadata: None,
                     }],
                     stop_reason: openfang_types::message::StopReason::EndTurn,
@@ -1512,5 +1560,42 @@ mod tests {
         assert_eq!(adjust_split_for_tool_pairs(&messages, 0), 0);
         assert_eq!(adjust_split_for_tool_pairs(&messages, 1), 1);
         assert_eq!(adjust_split_for_tool_pairs(&messages, 5), 5);
+    }
+
+    #[test]
+    fn test_is_plausible_summary_rejects_prompt_echo() {
+        // Exact system prompt from summarize_messages
+        assert!(!is_plausible_summary(
+            "You are a conversation summarizer. Produce a concise summary that captures \
+             all key facts, decisions, and context from the conversation."
+        ));
+        // Exact user prompt from summarize_messages
+        assert!(!is_plausible_summary(
+            "Summarize the following conversation preserving key facts, decisions, \
+             user preferences, and important context."
+        ));
+        // Merge-path system prompt
+        assert!(!is_plausible_summary(
+            "Merge these 3 conversation summaries into one concise, coherent summary."
+        ));
+    }
+
+    #[test]
+    fn test_is_plausible_summary_rejects_short() {
+        assert!(!is_plausible_summary(""));
+        assert!(!is_plausible_summary("ok"));
+        assert!(!is_plausible_summary("too short"));
+    }
+
+    #[test]
+    fn test_is_plausible_summary_accepts_real_summary() {
+        assert!(is_plausible_summary(
+            "The user asked about fibonacci in C. The assistant explained three \
+             approaches: iterative, lookup table, and matrix exponentiation."
+        ));
+        assert!(is_plausible_summary(
+            "User discussed cron jobs and library curation. Assistant disabled the \
+             doc-curation-weekly job after user requested it."
+        ));
     }
 }

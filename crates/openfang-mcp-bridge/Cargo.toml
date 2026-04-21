@@ -1,0 +1,23 @@
+[package]
+name = "openfang-mcp-bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Stdio MCP bridge: exposes OpenFang tools to Claude Code CLI via `claude --mcp-config`"
+
+[[bin]]
+name = "openfang-mcp-bridge"
+path = "src/main.rs"
+
+[dependencies]
+openfang-types = { path = "../openfang-types" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -50,6 +50,11 @@ pub fn bundled_hands() -> Vec<(&'static str, &'static str, &'static str)> {
             include_str!("../bundled/infisical-sync/HAND.toml"),
             include_str!("../bundled/infisical-sync/SKILL.md"),
         ),
+        (
+            "repo-digger",
+            include_str!("../bundled/repo-digger/HAND.toml"),
+            include_str!("../bundled/repo-digger/SKILL.md"),
+        ),
     ]
 }
 
@@ -81,7 +86,60 @@ mod tests {
     #[test]
     fn bundled_hands_count() {
         let hands = bundled_hands();
-        assert_eq!(hands.len(), 9);
+        assert_eq!(hands.len(), 10);
+    }
+
+    #[test]
+    fn repo_digger_registered() {
+        let hands = bundled_hands();
+        let ids: Vec<&str> = hands.iter().map(|(id, _, _)| *id).collect();
+        assert!(ids.contains(&"repo-digger"));
+    }
+
+    #[test]
+    fn repo_digger_hand_parses_and_has_required_fields() {
+        let hands = bundled_hands();
+        let (_, toml_content, skill) = hands
+            .iter()
+            .find(|(id, _, _)| *id == "repo-digger")
+            .expect("repo-digger must be registered");
+        let def = parse_hand_toml(toml_content).expect("HAND.toml must parse");
+        assert_eq!(def.id, "repo-digger");
+        // Load-bearing fields per the plan:
+        assert_eq!(
+            def.agent.workspace_override_setting.as_deref(),
+            Some("repo_path"),
+            "workspace_override_setting must point at repo_path"
+        );
+        assert!(
+            def.agent.cache_system_prompt,
+            "cache_system_prompt must be true (budget-critical under direct-API)"
+        );
+        assert_eq!(def.agent.provider, "claude-code");
+        // Tools that MUST be declared (MCP-namespaced + code_* + file_*):
+        for required in &[
+            "code_search",
+            "code_agent_spawn",
+            "agent_status",
+            "file_read",
+            "file_write",
+            "mcp_docs_mcp_search",
+            "mcp_docs_mcp_get_doc",
+            "mcp_docs_mcp_list_docs",
+        ] {
+            assert!(
+                def.tools.iter().any(|t| t == required),
+                "repo-digger tools missing required entry '{required}'"
+            );
+        }
+        // Tools that MUST NOT be granted (footguns the plan deliberately withheld):
+        for forbidden in &["shell_exec", "agent_spawn", "agent_send", "agent_kill"] {
+            assert!(
+                !def.tools.iter().any(|t| t == forbidden),
+                "repo-digger must NOT grant '{forbidden}' — see plan §Architecture"
+            );
+        }
+        assert!(!skill.is_empty(), "SKILL.md must ship with content");
     }
 
     #[test]

@@ -609,8 +609,13 @@ async fn parse_slack_event(
 
     let channel = event["channel"].as_str()?;
 
-    // Filter by allowed channels
-    if !allowed_channels.is_empty() && !allowed_channels.contains(&channel.to_string()) {
+    // Slack channel IDs: "C" = public channel, "G" = private/group, "D" = DM (im).
+    // Also honor an explicit `channel_type` field when Slack provides it.
+    let channel_type_hint = event["channel_type"].as_str();
+    let is_dm = channel_type_hint == Some("im") || channel.starts_with('D');
+
+    // Filter by allowed channels (DMs bypass the list — they're explicit 1:1).
+    if !is_dm && !allowed_channels.is_empty() && !allowed_channels.contains(&channel.to_string()) {
         return None;
     }
 
@@ -665,6 +670,11 @@ async fn parse_slack_event(
     if event_type == "app_mention" {
         metadata.insert("was_mentioned".to_string(), serde_json::Value::Bool(true));
     }
+    // DMs are 1:1 with the bot — treat every message as addressed to it so the
+    // bridge's `dm_policy` path (not `group_policy`) handles routing.
+    if is_dm {
+        metadata.insert("was_mentioned".to_string(), serde_json::Value::Bool(true));
+    }
 
     // Determine the real thread_ts from the event (None for top-level messages).
     let real_thread_ts = msg_data["thread_ts"]
@@ -707,7 +717,7 @@ async fn parse_slack_event(
         content,
         target_agent: None,
         timestamp,
-        is_group: true,
+        is_group: !is_dm,
         thread_id,
         metadata,
     })

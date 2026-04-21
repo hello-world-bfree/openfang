@@ -12,6 +12,7 @@ pub mod config;
 pub mod error;
 pub mod event;
 pub mod manifest_signing;
+pub mod mcp;
 pub mod media;
 pub mod memory;
 pub mod message;

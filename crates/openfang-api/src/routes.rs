@@ -2860,6 +2860,62 @@ pub async fn test_channel(
     )
 }
 
+/// GET /api/channels/{name}/status — report whether the channel's bridge adapter
+/// is currently running.
+///
+/// The source of truth is `kernel.channel_adapters`, which is populated when
+/// `start_channel_bridge_with_config` successfully boots an adapter and cleared
+/// when the bridge is torn down or a start attempt fails. A `running` flag of
+/// `true` means the adapter was registered and has not been shut down.
+pub async fn channel_status(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    let meta = match find_channel_meta(&name) {
+        Some(m) => m,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "name": name,
+                    "status": "unknown",
+                    "message": "Unknown channel",
+                })),
+            )
+        }
+    };
+
+    let running = state.kernel.channel_adapters.contains_key(&name);
+    let configured = meta.fields.iter().all(|f| {
+        if !f.required {
+            return true;
+        }
+        match f.env_var {
+            Some(env) => std::env::var(env).map(|v| !v.is_empty()).unwrap_or(false),
+            None => true,
+        }
+    });
+
+    let status_str = if running {
+        "running"
+    } else if configured {
+        "configured"
+    } else {
+        "unconfigured"
+    };
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "name": name,
+            "display_name": meta.display_name,
+            "status": status_str,
+            "running": running,
+            "configured": configured,
+        })),
+    )
+}
+
 /// Send a real test message to a specific channel/chat on the given platform.
 async fn send_channel_test_message(channel_name: &str, target_id: &str) -> Result<(), String> {
     let client = reqwest::Client::new();
@@ -7717,6 +7773,7 @@ pub async fn test_provider(
                 thinking: None,
                 cache_system_prompt: false,
                 min_cache_tokens: 0,
+                mcp_config_path: None,
             };
             match driver.complete(test_req).await {
                 Ok(_) => {
@@ -12383,6 +12440,231 @@ fn remove_toml_section(content: &str, section: &str) -> String {
         }
     }
     result
+}
+
+/// Request body for `POST /api/repo-digger/run`.
+#[derive(Debug, serde::Deserialize)]
+pub struct RepoDiggerRunRequest {
+    pub repo_path: String,
+    pub intent: String,
+    pub question: String,
+    #[serde(default)]
+    pub model_tier: Option<String>,
+    #[serde(default)]
+    pub budget_cap: Option<String>,
+    #[serde(default)]
+    pub use_docs_mcp: Option<bool>,
+    #[serde(default)]
+    pub plan_output_dir: Option<String>,
+}
+
+/// `POST /api/repo-digger/run` — Server-Sent Events stream of an
+/// investigation's progress. Activates the `repo-digger` Hand, kicks the
+/// coordinator with "go", subscribes to the agent's event channel, and
+/// emits every `hand_progress` / `investigation_complete` event + a final
+/// sentinel when the agent terminates.
+///
+/// Stream format (each line is an SSE `data:` frame carrying JSON):
+///   {"event":"activation","agent_id":"...","instance_id":"..."}
+///   {"event":"hand_progress","phase":"cache_probe","agent_id":"..."}
+///   {"event":"hand_progress","phase":"navigator","agent_id":"..."}
+///   ...
+///   {"event":"investigation_complete","artifact_path":"..."}
+///   {"event":"stream_end"}
+pub async fn repo_digger_run(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<RepoDiggerRunRequest>,
+) -> axum::response::Response {
+    use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
+
+    // Validate intent up-front — surfaces errors as a regular JSON 400 instead
+    // of burying them in an SSE stream.
+    if !matches!(body.intent.as_str(), "explain" | "debug" | "plan") {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!(
+                    "invalid intent '{}': expected explain | debug | plan",
+                    body.intent
+                )
+            })),
+        )
+            .into_response();
+    }
+
+    // Assemble the settings HashMap the Hand activation expects.
+    let mut config: std::collections::HashMap<String, serde_json::Value> =
+        std::collections::HashMap::new();
+    config.insert("repo_path".into(), serde_json::json!(body.repo_path));
+    config.insert("intent".into(), serde_json::json!(body.intent));
+    config.insert("question".into(), serde_json::json!(body.question));
+    if let Some(t) = body.model_tier {
+        config.insert("model_tier".into(), serde_json::json!(t));
+    }
+    if let Some(b) = body.budget_cap {
+        config.insert("budget_cap".into(), serde_json::json!(b));
+    }
+    if let Some(u) = body.use_docs_mcp {
+        config.insert("use_docs_mcp".into(), serde_json::json!(u.to_string()));
+    }
+    if let Some(d) = body.plan_output_dir {
+        config.insert("plan_output_dir".into(), serde_json::json!(d));
+    }
+
+    // Activate — sync-fail path returns 400 so client sees the reason.
+    let instance = match state.kernel.activate_hand("repo-digger", config, None) {
+        Ok(i) => i,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": format!("{e}") })),
+            )
+                .into_response();
+        }
+    };
+
+    let agent_id = match instance.agent_id {
+        Some(id) => id,
+        None => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "repo-digger Hand activated but no agent_id assigned"
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    // Subscribe BEFORE kicking the agent — otherwise fast phase events can
+    // fire between send_to_agent and subscribe.
+    //
+    // tool_event_publish emits events with target=Broadcast and payload as
+    // EventPayload::Custom(serialized bytes of {"type": event_type, "data": ...}).
+    // That routes through subscribe_all, NOT subscribe_agent. We subscribe to
+    // all broadcast events and filter by decoded event_type client-side.
+    let mut rx = state.kernel.event_bus.subscribe_all();
+
+    // Channel the subscription pumps SSE events through.
+    let (tx, sse_rx) = tokio::sync::mpsc::channel::<
+        Result<SseEvent, std::convert::Infallible>,
+    >(64);
+
+    // Emit the activation event immediately so the client knows the agent ID.
+    let activation_json = serde_json::json!({
+        "event": "activation",
+        "agent_id": agent_id.to_string(),
+        "instance_id": instance.instance_id.to_string(),
+        "hand_id": instance.hand_id,
+        "agent_name": instance.agent_name,
+    });
+    if tx
+        .send(Ok(SseEvent::default().data(activation_json.to_string())))
+        .await
+        .is_err()
+    {
+        // Client disconnected before even the first frame — just drop.
+        return (StatusCode::ACCEPTED, "").into_response();
+    }
+
+    // Kick the agent. Don't block the SSE response on send_to_agent.
+    let kernel = state.kernel.clone();
+    let agent_id_for_kick = agent_id;
+    tokio::spawn(async move {
+        let handle: Arc<dyn KernelHandle> = kernel.clone();
+        let _ = handle
+            .send_to_agent(&agent_id_for_kick.to_string(), "go")
+            .await;
+    });
+
+    // Pump events from the bus into the SSE channel. The task ends when
+    // either side disconnects, an `investigation_complete` event fires, or
+    // the broadcast lags beyond the channel capacity (we send a lag marker
+    // but continue — broadcast lag is recoverable).
+    tokio::spawn(async move {
+        use openfang_types::event::EventPayload;
+        loop {
+            match rx.recv().await {
+                Ok(event) => {
+                    // Custom-payload events from tool_event_publish carry
+                    // `{"type": "<event_type>", "data": {...}}`. Filter to the
+                    // two event types repo-digger emits. Other traffic (tool
+                    // results, memory deltas) is too noisy for an SSE stream.
+                    let EventPayload::Custom(bytes) = &event.payload else {
+                        continue;
+                    };
+                    let decoded: serde_json::Value =
+                        match serde_json::from_slice(bytes) {
+                            Ok(v) => v,
+                            Err(_) => continue,
+                        };
+                    let event_type = decoded
+                        .get("type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if event_type != "hand_progress"
+                        && event_type != "investigation_complete"
+                    {
+                        continue;
+                    }
+                    let data_payload = decoded
+                        .get("data")
+                        .cloned()
+                        .unwrap_or(serde_json::json!({}));
+                    let mut out = serde_json::Map::new();
+                    out.insert(
+                        "event".into(),
+                        serde_json::Value::String(event_type.to_string()),
+                    );
+                    out.insert(
+                        "event_id".into(),
+                        serde_json::Value::String(event.id.0.to_string()),
+                    );
+                    if let Some(obj) = data_payload.as_object() {
+                        for (k, v) in obj {
+                            out.insert(k.clone(), v.clone());
+                        }
+                    } else {
+                        out.insert("data".into(), data_payload);
+                    }
+                    let sse_data = serde_json::Value::Object(out).to_string();
+                    if tx
+                        .send(Ok(SseEvent::default().data(sse_data)))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                    if event_type == "investigation_complete" {
+                        let _ = tx
+                            .send(Ok(SseEvent::default()
+                                .data(r#"{"event":"stream_end"}"#)))
+                            .await;
+                        break;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    let warn = serde_json::json!({
+                        "event": "stream_lag",
+                        "dropped": n,
+                    });
+                    let _ = tx
+                        .send(Ok(SseEvent::default().data(warn.to_string())))
+                        .await;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+
+    let rx_stream = tokio_stream::wrappers::ReceiverStream::new(sse_rx);
+    Sse::new(rx_stream)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(std::time::Duration::from_secs(15))
+                .text("ping"),
+        )
+        .into_response()
 }
 
 #[cfg(test)]

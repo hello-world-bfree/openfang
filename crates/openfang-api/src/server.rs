@@ -292,6 +292,10 @@ pub async fn build_router(
             axum::routing::post(routes::test_channel),
         )
         .route(
+            "/api/channels/{name}/status",
+            axum::routing::get(routes::channel_status),
+        )
+        .route(
             "/api/channels/reload",
             axum::routing::post(routes::reload_channels),
         )
@@ -463,6 +467,12 @@ pub async fn build_router(
         .route(
             "/api/hands/instances/{id}/browser",
             axum::routing::get(routes::hand_instance_browser),
+        )
+        // Repo-digger convenience route — activate + send-go in one call.
+        // See routes::repo_digger_run for details.
+        .route(
+            "/api/repo-digger/run",
+            axum::routing::post(routes::repo_digger_run),
         )
         // MCP server endpoints
         .route(

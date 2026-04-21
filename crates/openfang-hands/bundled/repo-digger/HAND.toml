@@ -1,0 +1,251 @@
+id = "repo-digger"
+name = "Repo Digger"
+description = "Multi-agent codebase investigator — produces explainers, debug analyses, or Claude-Code-compatible implementation plans from a local repo, with file:line citations."
+category = "productivity"
+icon = "🔍"
+tools = [
+  "file_read",
+  "file_list",
+  "file_write",
+  "code_search",
+  "code_agent_spawn",
+  "agent_status",
+  "memory_store",
+  "memory_recall",
+  "knowledge_add_entity",
+  "knowledge_add_relation",
+  "knowledge_query",
+  "web_search",
+  "web_fetch",
+  "event_publish",
+  "hand_status",
+  # MCP-namespaced tools must be enumerated explicitly. Capability matching
+  # is exact-match (capability.rs:119) — no wildcards.
+  "mcp_docs_mcp_search",
+  "mcp_docs_mcp_get_doc",
+  "mcp_docs_mcp_list_docs",
+]
+
+# ─── Configurable settings ───────────────────────────────────────────────────
+
+[[settings]]
+key = "repo_path"
+label = "Repository Path"
+description = "Absolute path to the code repository to investigate. Becomes the agent's workspace root at activation time (validated by validate_hand_workspace)."
+setting_type = "text"
+default = "."
+
+[[settings]]
+key = "intent"
+label = "Investigation Intent"
+description = "What kind of artifact to produce."
+setting_type = "select"
+default = "explain"
+
+[[settings.options]]
+value = "explain"
+label = "Explainer — architecture tour with file:line citations"
+
+[[settings.options]]
+value = "debug"
+label = "Debug Analysis — hypothesis-ranked root-cause investigation"
+
+[[settings.options]]
+value = "plan"
+label = "Implementation Plan — Claude-Code-compatible plan file"
+
+[[settings]]
+key = "question"
+label = "Question / Symptom / Feature"
+description = "The specific question (explain), symptom (debug), or feature description (plan) that drives the investigation."
+setting_type = "text"
+default = ""
+
+[[settings]]
+key = "model_tier"
+label = "Model Tier (direct-API only)"
+description = "Cost/quality tier when the coordinator routes to a direct API (ignored under claude-code CLI — CLI picks its own model)."
+setting_type = "select"
+default = "balanced"
+
+[[settings.options]]
+value = "cheap"
+label = "Cheap (claude-haiku-4-5)"
+
+[[settings.options]]
+value = "balanced"
+label = "Balanced (claude-sonnet-4-6)"
+
+[[settings.options]]
+value = "premium"
+label = "Premium (claude-opus-4-5)"
+
+[[settings]]
+key = "budget_cap"
+label = "Budget Cap"
+description = "USD under direct-API; iteration-equivalent under claude-code (60 iters, ≤20 min wall). claude-code billing lives on your Claude subscription — openfang can't meter it."
+setting_type = "text"
+default = "2.00"
+
+[[settings]]
+key = "use_docs_mcp"
+label = "Use docs-mcp"
+description = "Route the Researcher sub-agent through the docs-mcp integration (if installed). Falls back to web_search when disabled or unhealthy."
+setting_type = "toggle"
+default = "true"
+
+[[settings]]
+key = "plan_output_dir"
+label = "Plan Output Directory"
+description = "Where to write final artifacts. Relative paths are resolved against repo_path. Default writes to <repo_path>/.openfang/plans/ — add that to .gitignore."
+setting_type = "text"
+default = ".openfang/plans"
+
+# ─── Agent configuration ─────────────────────────────────────────────────────
+
+[agent]
+name = "repo-digger"
+description = "Coordinator agent for multi-agent codebase investigations. Spawns Navigator / Searcher / Researcher / Citation Checker sub-agents via code_agent_spawn."
+module = "builtin:chat"
+# Default provider is claude-code — zero API keys. User can switch to a direct
+# API provider (anthropic / groq / openai) in ~/.openfang/config.toml. Under
+# claude-code, the kernel launches the CLI with --mcp-config pointing at an
+# openfang-mcp-bridge subprocess that routes tool calls back into the daemon.
+provider = "claude-code"
+model = "default"
+# The Hand's workspace is substituted at activation time from the `repo_path`
+# setting, bypassing the default <workspaces_dir>/<agent_name>. Validated by
+# validate_hand_workspace in openfang-hands/src/lib.rs — rejects ~/.ssh,
+# ~/.aws, ~/.claude, symlink escapes, paths less than 2 levels under $HOME,
+# and STATE_DIR overlap.
+workspace_override_setting = "repo_path"
+# System prompt is token-heavy (7-phase methodology). Cache it so re-runs and
+# sub-agent iterations reuse the prefix. Direct-API only; CLI has its own
+# caching.
+cache_system_prompt = true
+max_tokens = 16384
+temperature = 0.2
+max_iterations = 30
+# Investigations make long LLM calls + synchronous sub-agent dispatch. Kernel
+# default (30s) produces false-positive heartbeat recovery.
+heartbeat_interval_secs = 120
+system_prompt = """You are Repo Digger — a coordinator agent for multi-agent codebase investigations. Your job is to decompose a question about a local code repository into sub-agent tasks, collect their findings, and produce a single structured markdown artifact with verifiable file:line citations.
+
+## Phase 0 — Context
+
+At start of every investigation:
+1. Read the user's settings: `repo_path`, `intent` (explain | debug | plan), `question`, `budget_cap`, `use_docs_mcp`, `plan_output_dir`.
+2. Generate a run_id (UUID). Every memory_store key, knowledge entity, and output file name is scoped by this run_id as `inv:<run_id>:*`.
+3. Compute a cache key: sha256(repo_abs || git_rev || dirty_hash || intent || normalized_question || model_tier || use_docs_mcp). If a cached artifact exists at `~/.openfang/cache/repo-digger/<key>.artifact.md` AND its mtime is within 30 days AND git_rev matches, emit it immediately and stop.
+4. Emit `event_publish("hand_progress", {phase: "cache_probe", run_id, cached: <bool>})`.
+
+## Phase 1 — Navigator (sequential)
+
+Spawn Navigator to build the repo skeleton:
+```
+code_agent_spawn(role="navigator", seed={repo_path: "<root>", question_fragment: "<first 200 chars of question>"})
+```
+Then poll `agent_status(agent_id)` until `status=="done"` or `status=="error"`. Read findings via `memory_recall("inv:<run_id>:navigator")` — it writes a JSON blob with `{tree, languages, entrypoints, build_cmds, hotspots}`.
+
+Emit `event_publish("hand_progress", {phase: "navigator", run_id})` at start.
+
+## Phase 2 — Searcher + Researcher
+
+Spawn Searcher (always) and Researcher (only when intent∈{debug,plan}). Under provider=claude-code, spawn them SERIALLY — each CLI subprocess is RAM-heavy and the runtime's Arc<AtomicU32> concurrency cap will block a second parallel spawn. Under direct-API you may spawn both in one turn.
+
+Searcher seed: the specific patterns/symbols the question points at.
+Researcher seed: library/framework references plus what the user described.
+
+Poll `agent_status` for each. Read findings from memory/KG.
+
+## Phase 3 — Synthesize (intent-specific)
+
+Pick the template for `intent`:
+
+### explain.md
+```
+# Explainer: <question>  (inv:<run_id>, YYYY-MM-DD)
+## Confidence summary
+## TL;DR                  (≤3 sentences, every claim cited)
+## Architecture           (crates/modules + roles)
+## Key flow               (entrypoint → end, numbered, every step cited)
+## Extension points
+## Glossary
+## Sources                (files consulted with match counts)
+## Methodology limitations
+```
+
+### debug.md (hypothesis loop)
+```
+# Debug Analysis: <symptom>  (inv:<run_id>, YYYY-MM-DD)
+## Confidence summary
+## Reproduction          (commands/inputs [cite])
+## Hypotheses (ranked)   (evidence for/against each, all [cite])
+## Root cause            (one sentence [cite])
+## Fix sketch            (minimal-diff description, NOT a diff)
+## Verification          (commands + live curl)
+## Unknowns
+## Methodology limitations
+```
+Hypothesis loop: emit top-3 → targeted `code_search`/`file_read` per hypothesis → score → iterate ≤4 rounds or until one has ≥3 confirming, 0 disconfirming.
+
+### plan.md (Claude-Code-compatible, reuse-first)
+```
+# <Title>  (inv:<run_id>, YYYY-MM-DD)
+## Confidence summary
+## Context
+## Existing patterns to reuse  (REUSE-FIRST — every proposed new thing must
+                                cite the search that confirmed it doesn't
+                                already exist)
+## Approach               (strategy, alternatives considered briefly)
+## Files to create
+## Files to modify        (each line cited)
+## Step-by-step
+## Verification           (cargo build/test/clippy + live curl)
+## Critical files
+## Tradeoffs & risks
+## Out of scope
+## Methodology limitations
+```
+
+## Phase 4 — Citation check
+
+Every factual claim MUST end with `[path:LN]` or `[path:LN-LN]`. Regex: `\\[([^\\]]+?):(\\d+)(-\\d+)?\\]` (extension-agnostic).
+
+Spawn Citation Checker with the draft + extracted citation list. Checker does batched `file_read` — one read per unique file, covers all needed line ranges in one shot. Target cost: O(unique_files × 500 tokens).
+
+Read denylist (enforce client-side; Checker refuses to read these even if cited):
+- `.env`, `.envrc`, `.npmrc`, `.pypirc`, `.netrc`
+- `.git/config`, `.git/credentials`
+- `*.pem`, `*.key`, `*.p12`, `*.jks`
+- `secrets.*`, `credentials.*`
+- `.openfang/**` (self-investigation laundering)
+
+If Checker fails: up to 2 repair passes. On final failure append "Unverified claims" section listing them and ship anyway — user still learns something.
+
+## Phase 5 — Write + emit
+
+Write the artifact via `file_write` to `<plan_output_dir>/<intent>-<slug>-YYYY-MM-DD.md`. The workspace_sandbox write denylist (enforced at the tool layer, not here) rejects writes to `.git/**`, `.github/workflows/**`, Makefile, Dockerfile, CI configs — don't propose them.
+
+Emit:
+- `event_publish("hand_progress", {phase: "synthesize" / "citations" / "write"})`
+- `event_publish("investigation_complete", {run_id, artifact_path, run_token_usage})`
+
+## Rules
+
+- Every factual claim needs a file:line citation OR explicit marking in "Unknowns".
+- Never propose writing to `.git/**`, `.github/workflows/**`, CI configs, or build drivers — the sandbox blocks it and the attempt appears in audit logs.
+- Never echo secrets or credential-file contents into memory_store or event_publish payloads.
+- When docs_mcp is unhealthy or `use_docs_mcp=false`, fall back to web_search/web_fetch and note "external docs unavailable" in Methodology limitations.
+- If Navigator reports `too_large` (repo > 50k files), ask the user to narrow `repo_path` — don't silently truncate.
+- One-line-pointer protocol: `code_agent_spawn` returns `{agent_id}` immediately; poll via `agent_status`. Do NOT block on `agent_send`.
+"""
+
+[agent.capabilities]
+# Required because code_agent_spawn's cap-derivation expects AgentSpawn to
+# be in the coordinator's cap set (derived from tools list, but AgentSpawn
+# is kernel-level, not tool-level).
+agent_spawn = true
+
+[dashboard]
+metrics = []

@@ -62,6 +62,26 @@ pub struct OpenFangKernel {
     pub config: KernelConfig,
     /// Agent registry.
     pub registry: AgentRegistry,
+    /// MCP bridge auth registry — maps agent_id to cookie + run_id +
+    /// workspace + allowed_tools. Populated at activate_hand for Hands that
+    /// use the `claude-code` provider with `workspace_override_setting`.
+    /// Consulted by the UDS server to authenticate each tool-dispatch RPC.
+    pub mcp_bridge_registry: crate::mcp_bridge_server::AgentCookieRegistry,
+    /// Per-run state: which runs we've started a UDS listener for. Prevents
+    /// double-binding the same socket when a second sub-agent of the same
+    /// investigation registers.
+    pub mcp_bridge_active_runs: Arc<dashmap::DashSet<String>>,
+    /// Exclusive advisory lock on `$STATE_DIR/repo-digger/daemon.lock`.
+    /// Prevents a second daemon from sharing this state dir and racing the
+    /// orphan reaper. `None` when lock acquisition failed at startup
+    /// (non-fatal — daemon runs without MCP bridge isolation guarantees).
+    /// Dropped on kernel shutdown, which releases the lock.
+    _daemon_lock: Option<crate::mcp_bridge::DaemonLock>,
+    /// SHA-256 of the `openfang-mcp-bridge` binary at daemon startup. Used
+    /// as the baseline for integrity verification before each MCP config
+    /// write. `None` in dev builds or when the binary isn't resolvable at
+    /// startup — the check is skipped in those cases.
+    pub bridge_binary_hash: Option<[u8; 32]>,
     /// Capability manager.
     pub capabilities: CapabilityManager,
     /// Event bus.
@@ -84,6 +104,12 @@ pub struct OpenFangKernel {
     pub metering: Arc<MeteringEngine>,
     /// Default LLM driver (from kernel config).
     default_driver: Arc<dyn LlmDriver>,
+    /// Dedicated driver for session compaction / summarization.
+    ///
+    /// Configured via `[compaction]` in `config.toml`. When unset (or init failed),
+    /// this is `None` and the kernel falls back to `default_driver` (plus the
+    /// compactor's plausibility guard) for compaction.
+    compaction_driver: Option<(Arc<dyn LlmDriver>, String)>,
     /// WASM sandbox engine (shared across all WASM agent executions).
     wasm_sandbox: WasmSandbox,
     /// RBAC authentication manager.
@@ -764,6 +790,58 @@ impl OpenFangKernel {
             Arc::new(StubDriver) as Arc<dyn LlmDriver>
         };
 
+        // Build a dedicated compaction driver if [compaction] is configured in config.toml.
+        // Compaction needs a REST-API completion endpoint — an agentic CLI driver
+        // like claude-code can echo its own system prompt back as output, which
+        // then corrupts the canonical summary. Operators pin a real summarizer
+        // model here to avoid that.
+        let compaction_driver: Option<(Arc<dyn LlmDriver>, String)> = if !config
+            .compaction
+            .provider
+            .is_empty()
+        {
+            let comp_api_key = {
+                let env_var = if !config.compaction.api_key_env.is_empty() {
+                    config.compaction.api_key_env.clone()
+                } else {
+                    config.resolve_api_key_env(&config.compaction.provider)
+                };
+                credential_resolver
+                    .resolve(&env_var)
+                    .map(|z: zeroize::Zeroizing<String>| z.to_string())
+            };
+            let comp_cfg = DriverConfig {
+                provider: config.compaction.provider.clone(),
+                api_key: comp_api_key,
+                base_url: config
+                    .compaction
+                    .base_url
+                    .clone()
+                    .or_else(|| config.provider_urls.get(&config.compaction.provider).cloned()),
+                skip_permissions: true,
+            };
+            match drivers::create_driver(&comp_cfg) {
+                Ok(d) => {
+                    info!(
+                        provider = %config.compaction.provider,
+                        model = %config.compaction.model,
+                        "Compaction driver configured"
+                    );
+                    Some((d, config.compaction.model.clone()))
+                }
+                Err(e) => {
+                    warn!(
+                        provider = %config.compaction.provider,
+                        error = %e,
+                        "Compaction driver init failed — falling back to default_driver"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         // Initialize metering engine (shares the same SQLite connection as the memory substrate)
         let metering = Arc::new(MeteringEngine::new(Arc::new(
             openfang_memory::usage::UsageStore::new(memory.usage_conn()),
@@ -1137,9 +1215,75 @@ impl OpenFangKernel {
         let initial_broadcast = config.broadcast.clone();
         let auto_reply_engine = crate::auto_reply::AutoReplyEngine::new(config.auto_reply.clone());
 
+        // Acquire exclusive lock on $STATE_DIR/repo-digger/daemon.lock
+        // BEFORE the reaper runs — otherwise two concurrent daemons both
+        // read + reap each other's live files. On failure we log and
+        // proceed without the lock; the reaper still checks daemon_pid
+        // liveness per-file so correctness is preserved, but a multi-
+        // daemon deployment loses the belt-and-braces guarantee.
+        let daemon_lock = match crate::mcp_bridge::acquire_daemon_lock(
+            &config.effective_state_dir(),
+        ) {
+            Ok(lock) => {
+                info!(
+                    lock = %lock.path().display(),
+                    pid = lock.pid(),
+                    "Acquired daemon state-dir lock"
+                );
+                Some(lock)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                warn!(
+                    error = %e,
+                    "Another openfang daemon holds the state-dir lock; \
+                     continuing without MCP-bridge isolation. Set \
+                     OPENFANG_STATE_DIR to a distinct path per daemon \
+                     instance to silence this warning."
+                );
+                None
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to acquire daemon lock; continuing");
+                None
+            }
+        };
+
+        // Compute bridge binary hash at startup. If the binary isn't
+        // resolvable (missing in dev builds) skip — investigations will fail
+        // to provision the bridge later with a clearer error.
+        let bridge_binary_hash: Option<[u8; 32]> = match crate::mcp_bridge::resolve_bridge_binary()
+        {
+            Ok(path) => match crate::mcp_bridge::compute_bridge_hash(&path) {
+                Ok(h) => {
+                    info!(
+                        path = %path.display(),
+                        sha256 = %hex::encode(h),
+                        "Pinned MCP bridge binary hash at startup"
+                    );
+                    Some(h)
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        "Failed to hash bridge binary; integrity check will be skipped"
+                    );
+                    None
+                }
+            },
+            Err(_) => {
+                // Bridge not installed yet; repo-digger will fail at
+                // activation time with a clearer error.
+                None
+            }
+        };
+
         let kernel = Self {
             config,
             registry: AgentRegistry::new(),
+            mcp_bridge_registry: Arc::new(dashmap::DashMap::new()),
+            mcp_bridge_active_runs: Arc::new(dashmap::DashSet::new()),
+            _daemon_lock: daemon_lock,
+            bridge_binary_hash,
             capabilities: CapabilityManager::new(),
             event_bus: EventBus::new(),
             scheduler: AgentScheduler::new(),
@@ -1151,6 +1295,7 @@ impl OpenFangKernel {
             audit_log: Arc::new(AuditLog::with_db(memory.usage_conn())),
             metering,
             default_driver: driver,
+            compaction_driver,
             wasm_sandbox,
             auth,
             model_catalog: std::sync::RwLock::new(model_catalog),
@@ -1384,6 +1529,18 @@ impl OpenFangKernel {
                     warn!(agent = %entry.name, "{warning}");
                 }
             }
+        }
+
+        // Reap orphan MCP bridge configs left by dead daemons. No-op unless
+        // repo-digger has run before on this host. The `daemon_pid` check in
+        // the reaper prevents us from deleting a sibling live daemon's files.
+        match crate::mcp_bridge::reap_orphan_configs(
+            &kernel.config.effective_state_dir(),
+            std::process::id(),
+        ) {
+            Ok(0) => {}
+            Ok(n) => info!("Reaped {n} orphan MCP bridge config(s) at startup"),
+            Err(e) => warn!(error = %e, "Orphan MCP config reap failed; non-fatal"),
         }
 
         info!("OpenFang kernel booted successfully");
@@ -2657,6 +2814,8 @@ impl OpenFangKernel {
                 // Probe request only scores complexity; caching is irrelevant here.
                 cache_system_prompt: false,
                 min_cache_tokens: 0,
+                // Probe doesn't use MCP bridge tools.
+                mcp_config_path: None,
             };
             let (complexity, routed_model) = router.select_model(&probe);
             info!(
@@ -3334,8 +3493,25 @@ impl OpenFangKernel {
             ));
         }
 
-        let driver = self.resolve_driver(&entry.manifest)?;
-        let model = entry.manifest.model.model.clone();
+        // Driver selection for compaction:
+        //   1. If `[compaction]` is configured and its driver initialized, use it.
+        //   2. Otherwise fall back to the agent's own driver.
+        //
+        // Claude Code CLI is an agentic coding tool, not a general-purpose
+        // completion endpoint. Under degenerate single-turn summarize prompts
+        // it echoes its own --system-prompt verbatim, which then gets stored
+        // as canonical_summary and injected as a user turn on the next call,
+        // causing agents to regurgitate the prompt instead of answering.
+        // The compactor's `is_plausible_summary` guard catches the common
+        // echo case as a second line of defense.
+        let (driver, model) = if let Some((ref d, ref m)) = self.compaction_driver {
+            (Arc::clone(d), m.clone())
+        } else {
+            (
+                self.resolve_driver(&entry.manifest)?,
+                entry.manifest.model.model.clone(),
+            )
+        };
 
         let result = compact_session(driver, &model, &session, &config)
             .await
@@ -3436,6 +3612,29 @@ impl OpenFangKernel {
         self.event_bus.unsubscribe_agent(agent_id);
         self.triggers.remove_agent_triggers(agent_id);
 
+        // Cleanup MCP bridge auth + config file for this agent if it had one.
+        // We unlink the JSON here; the UDS socket is per-run (shared across
+        // sub-agents of the same investigation), so it stays until the last
+        // agent of that run is killed (tracked via mcp_bridge_active_runs).
+        let agent_id_str = agent_id.to_string();
+        if let Some((_, entry)) = self.mcp_bridge_registry.remove(&agent_id_str) {
+            let state_dir = self.config.effective_state_dir();
+            let config_path =
+                crate::mcp_bridge::mcp_config_path_for_agent(&state_dir, &agent_id_str);
+            let _ = std::fs::remove_file(&config_path);
+            // If this was the last agent in the run, also drop the socket.
+            let any_left = self
+                .mcp_bridge_registry
+                .iter()
+                .any(|e| e.value().run_id == entry.run_id);
+            if !any_left {
+                self.mcp_bridge_active_runs.remove(&entry.run_id);
+                let sock =
+                    crate::mcp_bridge::socket_path_for_run(&state_dir, &entry.run_id);
+                let _ = std::fs::remove_file(&sock);
+            }
+        }
+
         // Remove cron jobs so they don't linger as orphans (#504)
         let cron_removed = self.cron_scheduler.remove_agent_jobs(agent_id);
         if cron_removed > 0 {
@@ -3523,7 +3722,10 @@ impl OpenFangKernel {
                 system_prompt: def.agent.system_prompt.clone(),
                 api_key_env: def.agent.api_key_env.clone(),
                 base_url: def.agent.base_url.clone(),
-                cache_system_prompt: false,
+                // Threaded from HAND.toml [agent].cache_system_prompt. Only the
+                // Anthropic driver honors this today; non-Anthropic drivers ignore
+                // it. Budget-critical for long-prompt Hands like repo-digger.
+                cache_system_prompt: def.agent.cache_system_prompt,
             },
             capabilities: ManifestCapabilities {
                 tools: def.tools.clone(),
@@ -3535,10 +3737,12 @@ impl OpenFangKernel {
             ],
             autonomous: def.agent.max_iterations.map(|max_iter| AutonomousConfig {
                 max_iterations: max_iter,
-                // Use the hand-declared heartbeat interval if provided.
-                // The kernel default (30s) is too aggressive for hands making long LLM calls;
-                // HAND.toml authors should set this to reflect expected call latency.
-                heartbeat_interval_secs: def.agent.heartbeat_interval_secs.unwrap_or(30),
+                // Honor the hand-declared heartbeat interval when provided;
+                // otherwise inherit AutonomousConfig's default (300s).
+                heartbeat_interval_secs: def
+                    .agent
+                    .heartbeat_interval_secs
+                    .unwrap_or_else(|| AutonomousConfig::default().heartbeat_interval_secs),
                 ..Default::default()
             }),
             // Autonomous hands must run in Continuous mode so the background loop picks them up.
@@ -3611,6 +3815,124 @@ impl OpenFangKernel {
             );
         }
 
+        // Apply workspace_override_setting (e.g. repo-digger's `repo_path`).
+        // When the Hand declares this field, substitute the resolved setting's
+        // canonical PathBuf as the agent's workspace — so file_read /
+        // code_search can operate on the user's repo outside the default
+        // <workspaces_dir>/<agent_name> sandbox. validate_hand_workspace
+        // refuses sensitive paths, symlink escapes, and $STATE_DIR overlap.
+        if let Some(ref setting_key) = def.agent.workspace_override_setting {
+            let raw_value = instance
+                .config
+                .get(setting_key)
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    KernelError::OpenFang(OpenFangError::Internal(format!(
+                        "workspace_override_setting references '{setting_key}' but the setting \
+                         is missing or not a string. Check the Hand's [[settings]] block."
+                    )))
+                })?;
+            // Overlap guard: reject repo paths that contain or descend from
+            // the state dir (where per-run MCP config JSONs with auth cookies
+            // live). Without this, `OPENFANG_STATE_DIR` set inside a user
+            // repo would leak cookies on `git add -A`.
+            let state_dir = self.config.effective_state_dir();
+            let canonical = openfang_hands::validate_hand_workspace(raw_value, Some(&state_dir))
+                .map_err(|msg| {
+                    KernelError::OpenFang(OpenFangError::Internal(format!(
+                        "workspace_override_setting '{setting_key}' rejected: {msg}"
+                    )))
+                })?;
+            info!(
+                hand = %hand_id,
+                setting = %setting_key,
+                workspace = %canonical.display(),
+                "Applying Hand workspace override"
+            );
+            manifest.workspace = Some(canonical);
+        }
+
+        // MCP bridge config provisioning (claude-code provider only).
+        //
+        // When the Hand uses workspace_override_setting AND its provider is
+        // claude-code, the LLM can only reach openfang's tools through the
+        // MCP bridge. Write a per-agent config JSON with the tool list +
+        // cookie + UDS socket path; agent_loop reads this path from
+        // manifest.metadata and sets CompletionRequest.mcp_config_path
+        // so the driver appends --mcp-config / --strict-mcp-config /
+        // --disallowedTools flags to the spawned `claude` subprocess.
+        let mut bridge_provisioned: Option<(String, String, String, PathBuf)> = None;
+        if def.agent.workspace_override_setting.is_some()
+            && manifest.model.provider == "claude-code"
+        {
+            let run_id = format!("run-{}", uuid::Uuid::new_v4());
+            // Tentative agent_id — spawn below re-derives the authoritative
+            // id. For config filenames we just need uniqueness.
+            let provisional_agent_id = format!(
+                "{}-{}",
+                hand_id,
+                uuid::Uuid::new_v4().simple()
+            );
+            let cookie = crate::mcp_bridge::generate_cookie();
+            let state_dir = self.config.effective_state_dir();
+            let tools = openfang_runtime::tool_runner::builtin_tool_definitions();
+            // Integrity verification is strict in release builds, skipped
+            // in dev builds (the bridge binary changes on every cargo build,
+            // which would otherwise make every subsequent investigation
+            // fail until daemon restart).
+            let expected_hash = if cfg!(debug_assertions) {
+                None
+            } else {
+                self.bridge_binary_hash.as_ref()
+            };
+            match crate::mcp_bridge::write_bridge_config(
+                crate::mcp_bridge::WriteBridgeConfigArgs {
+                    state_dir: &state_dir,
+                    run_id: &run_id,
+                    agent_id: &provisional_agent_id,
+                    cookie: &cookie,
+                    tools: &tools,
+                    expected_hash,
+                },
+            ) {
+                Ok(path) => {
+                    info!(
+                        hand = %hand_id,
+                        mcp_config = %path.display(),
+                        run_id = %run_id,
+                        "Wrote MCP bridge config for Hand agent"
+                    );
+                    manifest.metadata.insert(
+                        "openfang_mcp_config_path".to_string(),
+                        serde_json::Value::String(path.to_string_lossy().into_owned()),
+                    );
+                    manifest.metadata.insert(
+                        "openfang_run_id".to_string(),
+                        serde_json::Value::String(run_id.clone()),
+                    );
+                    manifest.metadata.insert(
+                        "openfang_bridge_cookie".to_string(),
+                        serde_json::Value::String(cookie.clone()),
+                    );
+                    bridge_provisioned = Some((
+                        provisional_agent_id,
+                        cookie,
+                        run_id,
+                        manifest.workspace.clone().unwrap_or_default(),
+                    ));
+                }
+                Err(e) => {
+                    warn!(
+                        hand = %hand_id,
+                        error = %e,
+                        "Failed to write MCP bridge config; agent will run without bridge \
+                         — LLM tool calls under claude-code will be blocked until the \
+                         bridge binary is on PATH or co-located with openfang."
+                    );
+                }
+            }
+        }
+
         // If an agent with this hand's name already exists, remove it first.
         // Save triggers before kill so they can be restored under the new ID
         // (issue #519 — triggers were lost on agent restart).
@@ -3648,6 +3970,48 @@ impl OpenFangKernel {
             AgentId::from_string(hand_id)
         };
         let agent_id = self.spawn_agent_with_parent(manifest, None, Some(fixed_agent_id))?;
+
+        // Register the bridge-auth entry + spawn UDS listener if MCP was
+        // provisioned for this activation. The agent_id in the registry is
+        // the string form of the real spawned AgentId, not the provisional
+        // one used for filename uniqueness — that way tool-dispatch RPCs
+        // authenticate against the same ID the agent loop sees.
+        if let Some((_provisional, cookie, run_id, workspace_root)) = bridge_provisioned {
+            let entry = crate::mcp_bridge_server::AgentBridgeEntry {
+                cookie,
+                run_id: run_id.clone(),
+                workspace_root,
+                allowed_tools: def.tools.clone(),
+            };
+            crate::mcp_bridge_server::register_agent(
+                &self.mcp_bridge_registry,
+                agent_id.to_string(),
+                entry,
+            );
+            // Start a UDS listener for this run, if not already running.
+            // Multiple sub-agents of the same investigation share one socket
+            // so the active-runs set guards against double-bind.
+            if self.mcp_bridge_active_runs.insert(run_id.clone()) {
+                if let Some(weak) = self.self_handle.get() {
+                    if let Some(kernel_arc) = weak.upgrade() {
+                        let state_dir = self.config.effective_state_dir();
+                        if let Err(e) = crate::mcp_bridge_server::start_run_listener(
+                            kernel_arc,
+                            self.mcp_bridge_registry.clone(),
+                            &state_dir,
+                            &run_id,
+                        ) {
+                            warn!(
+                                run_id = %run_id,
+                                error = %e,
+                                "Failed to start MCP bridge UDS listener"
+                            );
+                            self.mcp_bridge_active_runs.remove(&run_id);
+                        }
+                    }
+                }
+            }
+        }
 
         // Restore triggers from the old agent under the new agent ID (#519).
         if !saved_triggers.is_empty() {
@@ -4923,10 +5287,53 @@ impl OpenFangKernel {
 
     /// Gracefully shutdown the kernel.
     ///
+    /// Cleanup all MCP bridge configs + UDS sockets for active investigations.
+    ///
+    /// Called at kernel shutdown. Iterates the bridge auth registry, collects
+    /// unique `(agent_id, run_id)` pairs, and unlinks each agent's
+    /// `mcp-<agent_id>.json` + the run's `kernel-<run_id>.sock`. Empties the
+    /// bridge-auth registry + active-runs set. Errors are logged and swallowed
+    /// — a best-effort cleanup is fine because the next startup's orphan
+    /// reaper catches anything we missed.
+    pub fn shutdown_mcp_bridge(&self) {
+        let state_dir = self.config.effective_state_dir();
+        let entries: Vec<(String, String)> = self
+            .mcp_bridge_registry
+            .iter()
+            .map(|e| (e.key().clone(), e.value().run_id.clone()))
+            .collect();
+        let count = entries.len();
+        for (agent_id, run_id) in entries {
+            if let Err(e) =
+                crate::mcp_bridge::cleanup_bridge_config(&state_dir, &agent_id, &run_id)
+            {
+                warn!(
+                    agent_id = %agent_id,
+                    run_id = %run_id,
+                    error = %e,
+                    "MCP bridge cleanup failed; orphan reaper will handle at next startup"
+                );
+            }
+        }
+        self.mcp_bridge_registry.clear();
+        self.mcp_bridge_active_runs.clear();
+        if count > 0 {
+            info!("Cleaned up {count} MCP bridge config(s) at shutdown");
+        }
+    }
+
     /// This cleanly shuts down in-memory state but preserves persistent agent
     /// data so agents are restored on the next boot.
     pub fn shutdown(&self) {
         info!("Shutting down OpenFang kernel...");
+
+        // Cleanup MCP bridge configs + sockets BEFORE other teardown so the
+        // bridge subprocesses see their sockets vanish and exit cleanly. If
+        // we left them until after supervisor.shutdown(), the daemon could
+        // exit while a bridge process is still waiting on a read — the
+        // bridge then gets EOF + exits on its own, but leaves the socket
+        // file as litter for the next startup's reaper.
+        self.shutdown_mcp_bridge();
 
         // Kill WhatsApp gateway child process if running
         if let Ok(guard) = self.whatsapp_gateway_pid.lock() {

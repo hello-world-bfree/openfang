@@ -206,6 +206,7 @@ pub async fn execute_tool(
         "file_write" => tool_file_write(input, workspace_root).await,
         "file_list" => tool_file_list(input, workspace_root).await,
         "apply_patch" => tool_apply_patch(input, workspace_root).await,
+        "code_search" => tool_code_search(input, workspace_root).await,
 
         // Web tools (upgraded: multi-provider search, SSRF-protected fetch)
         "web_fetch" => {
@@ -299,6 +300,10 @@ pub async fn execute_tool(
         "agent_spawn" => tool_agent_spawn(input, kernel, caller_agent_id).await,
         "agent_list" => tool_agent_list(kernel),
         "agent_kill" => tool_agent_kill(input, kernel),
+        "agent_status" => tool_agent_status(input, kernel),
+        "code_agent_spawn" => {
+            tool_code_agent_spawn(input, kernel, caller_agent_id, allowed_tools).await
+        }
 
         // Shared memory tools
         "memory_store" => tool_memory_store(input, kernel),
@@ -595,6 +600,33 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
+            name: "code_search".to_string(),
+            description: "Search code in the agent workspace with structured, paginated results. \
+                Uses ripgrep when available (native walkdir+regex fallback). Hard caps: 200 results/call, \
+                200 chars per match/context line, 5 context lines max, 30s wall-clock, 5MB raw output. \
+                Returns JSON: { results: [{path, line, col, text, ctx?}], next_cursor?, total, truncated, backend }.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Regex or literal pattern to search for" },
+                    "path": { "type": "string", "description": "Optional workspace-relative subdir to narrow the search" },
+                    "glob": { "type": "string", "description": "Include glob(s), comma-separated (e.g. '*.rs,!tests/**')" },
+                    "type": { "type": "string", "description": "rg --type alias (e.g. 'rust','py') — ignored by native fallback" },
+                    "max_results": { "type": "integer", "description": "Max results per call (capped at 200)" },
+                    "cursor": { "type": "string", "description": "Opaque continuation cursor from a previous next_cursor" },
+                    "context_lines": { "type": "integer", "description": "Context lines around each match (capped at 5)" },
+                    "mode": {
+                        "type": "string",
+                        "description": "Output mode",
+                        "enum": ["content", "files", "count"]
+                    },
+                    "ignore_case": { "type": "boolean", "description": "Case-insensitive match" },
+                    "literal": { "type": "boolean", "description": "Treat query as a literal string, not regex" }
+                },
+                "required": ["query"]
+            }),
+        },
+        ToolDefinition {
             name: "apply_patch".to_string(),
             description: "Apply a multi-hunk diff patch to add, update, move, or delete files. Use this for targeted edits instead of full file overwrites.".to_string(),
             input_schema: serde_json::json!({
@@ -673,6 +705,52 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                     }
                 },
                 "required": ["manifest_toml"]
+            }),
+        },
+        ToolDefinition {
+            name: "code_agent_spawn".to_string(),
+            description: "Spawn a role-templated code-investigation sub-agent. \
+                Capability-checked — the child's tool set is the intersection of the role's \
+                desired tools and the caller's allowed_tools. Short-spawn: returns {agent_id} \
+                immediately; poll via agent_status rather than blocking on agent_send. Roles: \
+                navigator (repo map), searcher (code_search hits), researcher (docs/web lookup), \
+                checker (citation verification).".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "role": {
+                        "type": "string",
+                        "enum": ["navigator", "searcher", "researcher", "checker"]
+                    },
+                    "seed": {
+                        "type": "object",
+                        "description": "Typed hand-off payload: {repo_path, question_fragment}. \
+                            question_fragment is capped at 512 bytes; allowlist charset; rejects \
+                            base64 blobs >64 chars and API-key-shaped strings (exfil defense).",
+                        "properties": {
+                            "repo_path": { "type": "string" },
+                            "question_fragment": { "type": "string" }
+                        },
+                        "required": ["repo_path", "question_fragment"]
+                    }
+                },
+                "required": ["role", "seed"]
+            }),
+        },
+        ToolDefinition {
+            name: "agent_status".to_string(),
+            description: "Query the status of a previously-spawned agent. Returns JSON: \
+                {agent_id, status ∈ {pending,running,done,error,completed_or_reaped}, model}. \
+                Used by coordinator to poll short-spawn sub-agents until they complete.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "agent_id": {
+                        "type": "string",
+                        "description": "Agent ID returned from code_agent_spawn or agent_spawn"
+                    }
+                },
+                "required": ["agent_id"]
             }),
         },
         ToolDefinition {
@@ -1315,6 +1393,18 @@ async fn tool_file_read(
         .map_err(|e| format!("Failed to read file: {e}"))
 }
 
+async fn tool_code_search(
+    input: &serde_json::Value,
+    workspace_root: Option<&Path>,
+) -> Result<String, String> {
+    let root = workspace_root
+        .ok_or("code_search requires a workspace_root (the agent has no assigned workspace)")?;
+    let parsed: crate::code_search::CodeSearchInput = serde_json::from_value(input.clone())
+        .map_err(|e| format!("invalid code_search input: {e}"))?;
+    let output = crate::code_search::run(parsed, root).await?;
+    serde_json::to_string(&output).map_err(|e| format!("failed to serialize output: {e}"))
+}
+
 async fn tool_file_write(
     input: &serde_json::Value,
     workspace_root: Option<&Path>,
@@ -1665,6 +1755,236 @@ async fn tool_agent_spawn(
     let (id, name) = kh.spawn_agent(manifest_toml, parent_id).await?;
     Ok(format!(
         "Agent spawned successfully.\n  ID: {id}\n  Name: {name}"
+    ))
+}
+
+/// Role-templated, capability-checked agent spawn used by the `repo-digger`
+/// Hand. Unlike generic `agent_spawn` (which takes raw TOML and skips the
+/// capability inheritance check), `code_agent_spawn`:
+///
+/// - Accepts a fixed `role ∈ {navigator, searcher, researcher, checker}`
+/// - Stamps a hand-private manifest template (LLM never writes raw TOML,
+///   closing the prompt-injection path where a malicious repo convinces
+///   the coordinator to declare `shell_exec` on its child)
+/// - Validates the `seed` struct with a charset allowlist and length cap
+/// - Derives `parent_caps` from the caller's `allowed_tools` and calls
+///   `spawn_agent_checked` so the child's tool set is a strict subset
+async fn tool_code_agent_spawn(
+    input: &serde_json::Value,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+    parent_id: Option<&str>,
+    allowed_tools: Option<&[String]>,
+) -> Result<String, String> {
+    let kh = require_kernel(kernel)?;
+    let role = input["role"]
+        .as_str()
+        .ok_or("Missing 'role' parameter (navigator | searcher | researcher | checker)")?;
+    let seed = input.get("seed").ok_or("Missing 'seed' parameter")?;
+    validate_seed(seed)?;
+
+    // Derive capability set from the caller's allowed_tools. Option A
+    // (partial enforcement) per plan §C — only ToolInvoke caps are enforced,
+    // not FileRead / NetConnect. Documented limitation.
+    let parent_caps: Vec<openfang_types::capability::Capability> = allowed_tools
+        .unwrap_or(&[])
+        .iter()
+        .map(|n| openfang_types::capability::Capability::ToolInvoke(n.clone()))
+        .collect();
+
+    let manifest_toml = stamp_role_manifest(role, seed, &parent_caps)?;
+    let (id, name) = kh
+        .spawn_agent_checked(&manifest_toml, parent_id, &parent_caps)
+        .await?;
+    // Short-spawn: return the agent_id immediately. Coordinator polls via
+    // agent_status rather than blocking — MCP progress notifications are not
+    // guaranteed to be honored by Claude Code's MCP client.
+    Ok(format!("{{\"agent_id\":\"{id}\",\"name\":\"{name}\"}}"))
+}
+
+/// Validate the `seed` object shape. The coordinator LLM constructs this,
+/// so a prompt-injected repo file could attempt to exfiltrate secrets via
+/// base64 blobs or API-key-shaped strings in `question_fragment`. Charset
+/// allowlist + length cap block both.
+fn validate_seed(seed: &serde_json::Value) -> Result<(), String> {
+    let obj = seed
+        .as_object()
+        .ok_or("'seed' must be an object with fields {repo_path, question_fragment}")?;
+    let repo_path = obj
+        .get("repo_path")
+        .and_then(|v| v.as_str())
+        .ok_or("seed.repo_path is required (string)")?;
+    let question = obj
+        .get("question_fragment")
+        .and_then(|v| v.as_str())
+        .ok_or("seed.question_fragment is required (string)")?;
+    if question.len() > 512 {
+        return Err(format!(
+            "seed.question_fragment exceeds 512 bytes (got {}). Shorten or split the investigation.",
+            question.len()
+        ));
+    }
+    // Reject strings that look like base64 blobs (>64 consecutive base64 chars
+    // with no whitespace) or API-key shapes (sk-..., pk_..., AKIA... ≥ 20 chars).
+    if looks_like_exfil(question) || looks_like_exfil(repo_path) {
+        return Err(
+            "seed contains suspicious high-entropy content (base64 blob or API-key shape). \
+             Possible prompt-injection exfiltration attempt — refusing to spawn."
+                .into(),
+        );
+    }
+    // Allow a broader charset than the plan's minimal set: repo paths use
+    // many punctuation chars (@, +, =, %). Reject only control chars + NUL.
+    for c in repo_path.chars().chain(question.chars()) {
+        if c.is_control() {
+            return Err("seed contains control characters".into());
+        }
+    }
+    Ok(())
+}
+
+fn looks_like_exfil(s: &str) -> bool {
+    // Long base64-ish run (no whitespace, only [A-Za-z0-9+/=_-]).
+    let b64_ok = |c: char| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=' | '_' | '-');
+    let mut run = 0usize;
+    let mut max_run = 0usize;
+    for c in s.chars() {
+        if b64_ok(c) {
+            run += 1;
+            max_run = max_run.max(run);
+        } else {
+            run = 0;
+        }
+    }
+    if max_run >= 64 {
+        return true;
+    }
+    // Common API-key prefixes with ≥20 chars of continuous alphanum.
+    for prefix in ["sk-", "sk_", "pk-", "pk_", "AKIA", "AIza", "ghp_", "xoxb-"] {
+        if let Some(rest) = s.find(prefix) {
+            let tail = &s[rest + prefix.len()..];
+            let run_len: usize = tail
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+                .count();
+            if run_len >= 20 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Stamp a hand-private manifest TOML for the requested role, with tool set
+/// enforced to be a strict subset of `parent_caps` (intersection of the
+/// role's desired tools with the parent's granted tools).
+///
+/// This keeps the LLM out of manifest authoring entirely — roles are fixed
+/// at compile time, the model only picks the role string.
+fn stamp_role_manifest(
+    role: &str,
+    seed: &serde_json::Value,
+    parent_caps: &[openfang_types::capability::Capability],
+) -> Result<String, String> {
+    // Desired tool sets per role (plan §Sub-agent roles).
+    let desired: &[&str] = match role {
+        "navigator" => &[
+            "file_list",
+            "file_read",
+            "code_search",
+            "memory_store",
+            "knowledge_add_entity",
+        ],
+        "searcher" => &[
+            "code_search",
+            "file_read",
+            "memory_store",
+            "knowledge_add_relation",
+        ],
+        "researcher" => &[
+            "web_search",
+            "web_fetch",
+            "memory_recall",
+            "memory_store",
+            "mcp_docs_mcp_search",
+            "mcp_docs_mcp_get_doc",
+            "mcp_docs_mcp_list_docs",
+        ],
+        "checker" => &["file_read", "code_search", "memory_store"],
+        other => {
+            return Err(format!(
+                "unknown role '{other}' (expected: navigator | searcher | researcher | checker)"
+            ));
+        }
+    };
+
+    // Intersect with parent_caps — role may declare more than the parent has
+    // (e.g. docs_mcp tools when the coordinator didn't grant them because
+    // docs-mcp isn't installed). The intersection is the enforced tool set.
+    let parent_names: std::collections::HashSet<&str> = parent_caps
+        .iter()
+        .filter_map(|c| match c {
+            openfang_types::capability::Capability::ToolInvoke(n) => Some(n.as_str()),
+            _ => None,
+        })
+        .collect();
+    let final_tools: Vec<&str> = desired
+        .iter()
+        .copied()
+        .filter(|t| parent_names.contains(*t))
+        .collect();
+
+    // Encode seed as an embedded JSON string so parent→child handoff context
+    // survives TOML round-trip. The sub-agent's prompt builder parses it back.
+    let seed_json = serde_json::to_string(seed).unwrap_or_else(|_| "{}".to_string());
+    let seed_escaped = seed_json.replace('\\', "\\\\").replace('"', "\\\"");
+
+    let tools_toml = final_tools
+        .iter()
+        .map(|t| format!("\"{t}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    // Minimal manifest — kernel fills provider/model from parent context.
+    // `[model].cache_system_prompt = true` because all role-templated
+    // sub-agents inherit the coordinator's long (3k+ token) system prompt
+    // by convention; without caching, each iteration re-pays the input cost.
+    // `[capabilities].tools` mirrors the top-level tools list — the kernel's
+    // manifest_to_capabilities path reads this to grant Capability::ToolInvoke.
+    let caps_tools = tools_toml.clone();
+    Ok(format!(
+        r#"
+name = "repo-digger-{role}"
+role = "{role}"
+seed_context = "{seed_escaped}"
+tools = [{tools_toml}]
+
+[model]
+cache_system_prompt = true
+
+[capabilities]
+tools = [{caps_tools}]
+"#
+    ))
+}
+
+fn tool_agent_status(
+    input: &serde_json::Value,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+) -> Result<String, String> {
+    let kh = require_kernel(kernel)?;
+    let agent_id = input["agent_id"]
+        .as_str()
+        .ok_or("Missing 'agent_id' parameter")?;
+    // Walk the agent list; if found, report state. Absence → treat as
+    // completed (ephemeral sub-agents get reaped from the registry).
+    let agents = kh.list_agents();
+    let info = agents.iter().find(|a| a.id == agent_id);
+    let (status, model) = match info {
+        Some(a) => (a.state.to_string(), format!("{}:{}", a.model_provider, a.model_name)),
+        None => ("completed_or_reaped".to_string(), String::new()),
+    };
+    Ok(format!(
+        "{{\"agent_id\":\"{agent_id}\",\"status\":\"{status}\",\"model\":\"{model}\"}}"
     ))
 }
 
@@ -4318,6 +4638,43 @@ mod tests {
         ) -> Result<(String, String), String> {
             Err("not used".into())
         }
+        /// Test-grade enforcement: parses `tools = [...]` from the child
+        /// manifest TOML and asserts every entry resolves to a
+        /// `Capability::ToolInvoke(name)` present in `parent_caps`. This
+        /// mirrors the partial enforcement the real kernel performs for
+        /// `code_agent_spawn` (derive-from-allowed_tools, Option A).
+        async fn spawn_agent_checked(
+            &self,
+            manifest_toml: &str,
+            _parent_id: Option<&str>,
+            parent_caps: &[openfang_types::capability::Capability],
+        ) -> Result<(String, String), String> {
+            // Extract the child's declared tools from the manifest TOML. Any
+            // robust parser is fine here; `toml::Value` lookup avoids pulling
+            // in AgentManifest's full type surface in this test-only module.
+            let parsed: toml::Value =
+                toml::from_str(manifest_toml).map_err(|e| format!("invalid child manifest: {e}"))?;
+            let child_tools: Vec<String> = parsed
+                .get("tools")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            for tool in &child_tools {
+                let required = openfang_types::capability::Capability::ToolInvoke(tool.clone());
+                if !parent_caps.contains(&required) {
+                    return Err(format!(
+                        "capability escalation: child requested tool '{tool}' \
+                         not present in parent_caps"
+                    ));
+                }
+            }
+            Ok(("fake-agent-id".to_string(), "fake-agent-name".to_string()))
+        }
         async fn send_to_agent(&self, _agent_id: &str, _message: &str) -> Result<String, String> {
             Err("not used".into())
         }
@@ -4439,6 +4796,197 @@ mod tests {
         assert_eq!(job["action"]["message"], "Daily report");
         assert!(job["schedule"]["expr"].is_string());
         assert_eq!(job["one_shot"], false);
+    }
+
+    #[test]
+    fn test_validate_seed_rejects_base64_blob() {
+        let seed = serde_json::json!({
+            "repo_path": "/tmp/repo",
+            "question_fragment": format!(
+                "SGVsbG8gV29ybGQgdGhpcyBpcyBhIHZlcnkgbG9uZyBiYXNlNjQgYmxvYiB0aGF0IG1pZ2h0IGNvbnRhaW4g{}",
+                "YSBzZWNyZXQgZXhmaWx0cmF0aW9uIGF0dGVtcHQ="
+            ),
+        });
+        let err = validate_seed(&seed).unwrap_err();
+        assert!(err.contains("exfil") || err.contains("high-entropy"));
+    }
+
+    #[test]
+    fn test_validate_seed_rejects_api_key_shape() {
+        let seed = serde_json::json!({
+            "repo_path": "/tmp/repo",
+            "question_fragment": "what does sk-abc123def456ghi789jklmno do?",
+        });
+        let err = validate_seed(&seed).unwrap_err();
+        assert!(err.contains("exfil"));
+    }
+
+    #[test]
+    fn test_validate_seed_rejects_oversized_question() {
+        let seed = serde_json::json!({
+            "repo_path": "/tmp/repo",
+            "question_fragment": "x".repeat(513),
+        });
+        let err = validate_seed(&seed).unwrap_err();
+        assert!(err.contains("512"));
+    }
+
+    #[test]
+    fn test_validate_seed_accepts_ordinary_question() {
+        let seed = serde_json::json!({
+            "repo_path": "/Users/me/dev/myproj",
+            "question_fragment": "how does the Hand system route tool calls through the bridge?",
+        });
+        assert!(validate_seed(&seed).is_ok());
+    }
+
+    #[test]
+    fn test_validate_seed_rejects_control_chars() {
+        let seed = serde_json::json!({
+            "repo_path": "/tmp/repo",
+            "question_fragment": "line1\nline2",
+        });
+        let err = validate_seed(&seed).unwrap_err();
+        assert!(err.contains("control"));
+    }
+
+    #[test]
+    fn test_stamp_role_manifest_intersects_parent_caps() {
+        use openfang_types::capability::Capability;
+        // Parent grants navigator's desired tools but not code_search.
+        let parent_caps = vec![
+            Capability::ToolInvoke("file_list".into()),
+            Capability::ToolInvoke("file_read".into()),
+            Capability::ToolInvoke("memory_store".into()),
+            Capability::ToolInvoke("knowledge_add_entity".into()),
+            // code_search deliberately absent.
+        ];
+        let seed = serde_json::json!({"repo_path":"/tmp","question_fragment":"x"});
+        let toml = stamp_role_manifest("navigator", &seed, &parent_caps).unwrap();
+        assert!(toml.contains("\"file_list\""));
+        assert!(toml.contains("\"file_read\""));
+        assert!(
+            !toml.contains("\"code_search\""),
+            "tool not in parent_caps must NOT appear in child manifest"
+        );
+    }
+
+    #[test]
+    fn test_stamp_role_manifest_rejects_unknown_role() {
+        let seed = serde_json::json!({"repo_path":"/tmp","question_fragment":"x"});
+        let err = stamp_role_manifest("scavenger", &seed, &[]).unwrap_err();
+        assert!(err.contains("unknown role"));
+    }
+
+    #[test]
+    fn test_stamp_role_manifest_sets_cache_system_prompt() {
+        use openfang_types::capability::Capability;
+        let parent_caps = vec![
+            Capability::ToolInvoke("file_list".into()),
+            Capability::ToolInvoke("file_read".into()),
+            Capability::ToolInvoke("code_search".into()),
+            Capability::ToolInvoke("memory_store".into()),
+            Capability::ToolInvoke("knowledge_add_entity".into()),
+        ];
+        let seed = serde_json::json!({"repo_path":"/tmp","question_fragment":"x"});
+        let toml_str = stamp_role_manifest("navigator", &seed, &parent_caps).unwrap();
+        // Parses as valid TOML with cache_system_prompt = true.
+        let parsed: toml::Value = toml::from_str(&toml_str).unwrap();
+        assert_eq!(
+            parsed["model"]["cache_system_prompt"].as_bool(),
+            Some(true),
+            "sub-agent manifest MUST set cache_system_prompt=true (budget-critical)"
+        );
+    }
+
+    #[test]
+    fn test_stamp_role_manifest_emits_capabilities_tools() {
+        use openfang_types::capability::Capability;
+        let parent_caps = vec![
+            Capability::ToolInvoke("file_read".into()),
+            Capability::ToolInvoke("code_search".into()),
+            Capability::ToolInvoke("memory_store".into()),
+            Capability::ToolInvoke("knowledge_add_relation".into()),
+        ];
+        let seed = serde_json::json!({"repo_path":"/tmp","question_fragment":"x"});
+        let toml_str = stamp_role_manifest("searcher", &seed, &parent_caps).unwrap();
+        let parsed: toml::Value = toml::from_str(&toml_str).unwrap();
+        let caps_tools = parsed["capabilities"]["tools"].as_array().unwrap();
+        let names: Vec<&str> = caps_tools.iter().filter_map(|v| v.as_str()).collect();
+        // Capabilities.tools must mirror top-level tools so manifest_to_capabilities
+        // grants the right ToolInvoke set.
+        assert!(names.contains(&"code_search"));
+        assert!(names.contains(&"file_read"));
+        assert!(names.contains(&"memory_store"));
+    }
+
+    #[test]
+    fn test_stamp_role_manifest_researcher_includes_mcp_tools() {
+        use openfang_types::capability::Capability;
+        let parent_caps = vec![
+            Capability::ToolInvoke("web_search".into()),
+            Capability::ToolInvoke("web_fetch".into()),
+            Capability::ToolInvoke("memory_recall".into()),
+            Capability::ToolInvoke("memory_store".into()),
+            Capability::ToolInvoke("mcp_docs_mcp_search".into()),
+            Capability::ToolInvoke("mcp_docs_mcp_get_doc".into()),
+            Capability::ToolInvoke("mcp_docs_mcp_list_docs".into()),
+        ];
+        let seed = serde_json::json!({"repo_path":"/tmp","question_fragment":"x"});
+        let toml = stamp_role_manifest("researcher", &seed, &parent_caps).unwrap();
+        assert!(toml.contains("\"mcp_docs_mcp_search\""));
+        assert!(toml.contains("\"mcp_docs_mcp_get_doc\""));
+        assert!(toml.contains("\"mcp_docs_mcp_list_docs\""));
+    }
+
+    #[tokio::test]
+    async fn test_spawn_agent_checked_rejects_tool_escalation() {
+        use openfang_types::capability::Capability;
+        let fake = FakeKernelHandle::new();
+        let parent_caps = vec![Capability::ToolInvoke("file_read".into())];
+        // Child asks for a tool the parent wasn't granted.
+        let child_toml = r#"
+name = "evil-child"
+tools = ["file_read", "shell_exec"]
+"#;
+        let result = fake
+            .spawn_agent_checked(child_toml, Some("parent"), &parent_caps)
+            .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("shell_exec"));
+        assert!(err.contains("capability escalation"));
+    }
+
+    #[tokio::test]
+    async fn test_spawn_agent_checked_allows_subset() {
+        use openfang_types::capability::Capability;
+        let fake = FakeKernelHandle::new();
+        let parent_caps = vec![
+            Capability::ToolInvoke("file_read".into()),
+            Capability::ToolInvoke("code_search".into()),
+        ];
+        let child_toml = r#"
+name = "good-child"
+tools = ["file_read"]
+"#;
+        let result = fake
+            .spawn_agent_checked(child_toml, Some("parent"), &parent_caps)
+            .await;
+        assert!(result.is_ok(), "subset of parent caps must be accepted");
+    }
+
+    #[tokio::test]
+    async fn test_spawn_agent_checked_accepts_empty_child_tools() {
+        use openfang_types::capability::Capability;
+        let fake = FakeKernelHandle::new();
+        let parent_caps = vec![Capability::ToolInvoke("file_read".into())];
+        // No tools declared — trivially a subset.
+        let child_toml = r#"name = "quiet-child""#;
+        let result = fake
+            .spawn_agent_checked(child_toml, Some("parent"), &parent_caps)
+            .await;
+        assert!(result.is_ok());
     }
 
     #[tokio::test]

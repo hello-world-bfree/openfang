@@ -236,8 +236,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut reg = IntegrationRegistry::new(dir.path());
         let count = reg.load_bundled();
-        assert_eq!(count, 25);
-        assert_eq!(reg.template_count(), 25);
+        assert_eq!(count, 26);
+        assert_eq!(reg.template_count(), 26);
     }
 
     #[test]

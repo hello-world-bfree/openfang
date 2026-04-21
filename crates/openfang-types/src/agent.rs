@@ -88,7 +88,10 @@ impl Default for AutonomousConfig {
             quiet_hours: None,
             max_iterations: 50,
             max_restarts: 10,
-            heartbeat_interval_secs: 30,
+            // 300s yields a 600s (10min) unresponsiveness bound via UNRESPONSIVE_MULTIPLIER.
+            // The prior 30s default made idle autonomous agents churn through Crashed→Recover
+            // every 60-90s without any real fault.
+            heartbeat_interval_secs: 300,
             heartbeat_channel: None,
         }
     }
@@ -739,7 +742,7 @@ mod tests {
         let cfg = AutonomousConfig::default();
         assert_eq!(cfg.max_iterations, 50);
         assert_eq!(cfg.max_restarts, 10);
-        assert_eq!(cfg.heartbeat_interval_secs, 30);
+        assert_eq!(cfg.heartbeat_interval_secs, 300);
         assert!(cfg.quiet_hours.is_none());
     }
 
