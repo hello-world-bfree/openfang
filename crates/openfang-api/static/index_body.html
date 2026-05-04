@@ -1711,6 +1711,18 @@
                 </div>
               </div>
 
+              <!-- Auto-disabled banner -->
+              <div class="card mb-4" x-show="autoDisabledCount() > 0" style="border-left:3px solid var(--danger);background:rgba(255,80,80,0.06)">
+                <div class="font-bold" style="font-size:13px;margin-bottom:4px;color:var(--danger)">
+                  <span x-text="autoDisabledCount()"></span> job(s) auto-disabled after repeated failures
+                </div>
+                <div class="text-sm text-dim" style="line-height:1.6">
+                  These jobs hit 5 consecutive errors and were paused. Click <strong>Enable</strong> on each row to retry.
+                  After this fix, weekly jobs using <code style="color:var(--accent)">0 2 * * 0</code> (Vixie Sunday=0)
+                  will compute correctly.
+                </div>
+              </div>
+
               <!-- Jobs Table -->
               <div class="table-wrap" x-show="jobs.length">
                 <table>
@@ -1767,7 +1779,8 @@
                         </td>
                         <td class="truncate" style="max-width:120px" x-text="agentName(job.agent_id || job.agent)" :title="job.agent_id || job.agent"></td>
                         <td>
-                          <span class="badge" :class="job.enabled ? 'badge-success' : 'badge-dim'" x-text="job.enabled ? 'Active' : 'Paused'"></span>
+                          <span class="badge" :class="statusClass(job)" x-text="statusLabel(job)" :title="job.last_status || ''"></span>
+                          <div class="text-xs text-dim" x-show="job.consecutive_errors > 0" x-text="'errors: ' + job.consecutive_errors"></div>
                         </td>
                         <td>
                           <div class="flex gap-1" style="flex-wrap:wrap;max-width:240px" x-show="(job.delivery_targets || []).length">

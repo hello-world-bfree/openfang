@@ -4300,6 +4300,7 @@ dependencies = [
  "async-trait",
  "bitflags 2.11.0",
  "chrono",
+ "cron",
  "dirs 6.0.0",
  "ed25519-dalek",
  "hex",

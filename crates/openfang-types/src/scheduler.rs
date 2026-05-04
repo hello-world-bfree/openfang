@@ -538,11 +538,126 @@ pub(crate) fn is_private_or_reserved_host(url_str: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Cron expression basic format validation
+// Cron expression validation + DOW normalization
 // ---------------------------------------------------------------------------
+//
+// `cron 0.16` uses a non-Vixie day-of-week convention (Sunday=1, Saturday=7,
+// `inclusive_min=1`). Users typing standard Vixie/POSIX `0` for Sunday hit a
+// parse error and the kernel falls back to `+1h`, causing rapid refire until
+// the auto-disable trips at 5 errors. To preserve the user's mental model
+// (`0=Sun` OR `7=Sun`), we expand the DOW field to a concrete ordinal set in
+// `1..=7` before handing it to the cron crate. This is parse-time only —
+// the on-disk `expr` field is never mutated, so users see what they typed.
 
-/// Basic cron expression format validation: must have exactly 5 whitespace-separated fields.
-/// Actual parsing and scheduling is done in the kernel crate.
+/// Normalize the DOW (5th) field of a 5-field cron expression so it is
+/// compatible with `cron-0.16`'s Sunday=1..Saturday=7 convention.
+///
+/// Returns `Cow::Borrowed(expr)` when no normalization is needed (zero alloc).
+/// Returns `Cow::Owned(rewritten)` when the DOW field contained `0` or a
+/// range/list/step that resolved to a non-canonical form.
+///
+/// # Examples
+/// `"0 2 * * 0"` -> `"0 2 * * 1"`     (Vixie Sun -> cron-0.16 Sun)
+/// `"0 2 * * 7"` -> `"0 2 * * 1"`     (alt Sun -> cron-0.16 Sun; was silently Saturday before)
+/// `"0 2 * * *"` -> `"0 2 * * *"`     (no change, no alloc)
+/// `"0 2 * * 0,3"` -> `"0 2 * * 1,3"` (list with Vixie Sun -> {Sun, Tue})
+/// `"0 2 * * 0-6/2"` -> `"0 2 * * 1,3,5,7"` (Sun, Tue, Thu, Sat)
+pub fn normalize_cron_dow(expr: &str) -> std::borrow::Cow<'_, str> {
+    let trimmed = expr.trim();
+    let fields: Vec<&str> = trimmed.split_whitespace().collect();
+    if fields.len() != 5 {
+        return std::borrow::Cow::Borrowed(expr);
+    }
+    let dow = fields[4];
+    match expand_dow_set(dow) {
+        Some(canonical) if canonical != dow => {
+            let mut out = String::with_capacity(expr.len() + 4);
+            out.push_str(fields[0]);
+            for f in &fields[1..4] {
+                out.push(' ');
+                out.push_str(f);
+            }
+            out.push(' ');
+            out.push_str(&canonical);
+            std::borrow::Cow::Owned(out)
+        }
+        _ => std::borrow::Cow::Borrowed(expr),
+    }
+}
+
+/// Expand a single DOW field token into a canonical comma-list using cron-0.16
+/// ordinals (1=Sun..7=Sat). Returns `None` for `*`/`?` (no expansion needed)
+/// or for malformed input that contains non-numeric tokens (caller passes
+/// through; the cron crate's PHF map handles names like `MON-FRI`).
+///
+/// Numeric tokens are interpreted in **Vixie/POSIX convention**: `0` and `7`
+/// mean Sunday, `1..=6` mean Mon..Sat. Each Vixie ordinal is shifted by +1
+/// (with `0|7` clamped to 1) to cron-0.16's space. This means a user typing
+/// `1-5` (the standard "Mon-Fri" tutorial form) gets Mon-Fri, not Sun-Thu.
+fn expand_dow_set(field: &str) -> Option<String> {
+    if field == "*" || field == "?" {
+        return None;
+    }
+    let mut set: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+    for token in field.split(',') {
+        let (range, step) = match token.split_once('/') {
+            Some((r, s)) => {
+                let n = s.parse::<u32>().ok()?;
+                if n == 0 {
+                    return None;
+                }
+                (r, n)
+            }
+            None => (token, 1u32),
+        };
+        let (lo, hi) = if let Some((a, b)) = range.split_once('-') {
+            let lo_raw: u32 = a.trim().parse().ok()?;
+            let hi_raw: u32 = b.trim().parse().ok()?;
+            if lo_raw > 7 || hi_raw > 7 {
+                return None;
+            }
+            (lo_raw, hi_raw)
+        } else if range == "*" {
+            (0, 6)
+        } else {
+            let v_raw: u32 = range.trim().parse().ok()?;
+            if v_raw > 7 {
+                return None;
+            }
+            (v_raw, v_raw)
+        };
+        if lo > hi {
+            return None;
+        }
+        let mut i = lo;
+        while i <= hi {
+            // Map Vixie ordinal -> cron-0.16 ordinal:
+            //   Vixie 0 (Sun) -> 1
+            //   Vixie 7 (alt Sun) -> 1
+            //   Vixie 1..=6 (Mon..Sat) -> 2..=7
+            let mapped = match i {
+                0 | 7 => 1,
+                n => n + 1,
+            };
+            set.insert(mapped);
+            i = i.checked_add(step)?;
+        }
+    }
+    if set.is_empty() {
+        return None;
+    }
+    Some(
+        set.iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(","),
+    )
+}
+
+/// Validate a cron expression and confirm it parses against `cron-0.16` after
+/// DOW normalization. Rejects empty input, wrong field count, invalid
+/// characters, and Quartz extensions (`L`, `#`, `W`) that cron-0.16 doesn't
+/// support.
 fn validate_cron_expr(expr: &str) -> Result<(), String> {
     let trimmed = expr.trim();
     if trimmed.is_empty() {
@@ -556,20 +671,35 @@ fn validate_cron_expr(expr: &str) -> Result<(), String> {
             trimmed
         ));
     }
-    // Basic character validation per field — allow digits, *, /, -, and ,.
+    // Basic character validation per field — allow digits, letters (for names
+    // like SUN/MON), *, /, -, and ,. Reject Quartz extensions (L, #, W) up
+    // front with a helpful message.
     for (i, field) in fields.iter().enumerate() {
         if field.is_empty() {
             return Err(format!("cron field {i} is empty"));
         }
+        if field.contains('L') || field.contains('#') || field.contains('W') {
+            return Err(format!(
+                "cron field {i} uses Quartz extension (L/#/W) which is not supported: \"{field}\""
+            ));
+        }
         if !field
             .chars()
-            .all(|c| c.is_ascii_digit() || matches!(c, '*' | '/' | '-' | ',' | '?'))
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '*' | '/' | '-' | ',' | '?'))
         {
             return Err(format!(
                 "cron field {i} contains invalid characters: \"{field}\""
             ));
         }
     }
+    // Round-trip through cron-0.16 to catch out-of-range numerics, malformed
+    // ranges, and unsupported names. Normalize DOW first so Vixie Sunday=0
+    // doesn't trip the parser's `inclusive_min=1` check.
+    let normalized = normalize_cron_dow(trimmed);
+    let seven_field = format!("0 {} *", normalized.trim());
+    seven_field.parse::<cron::Schedule>().map_err(|e| {
+        format!("cron expression {trimmed:?} failed to parse: {e}")
+    })?;
     Ok(())
 }
 
@@ -783,11 +913,101 @@ mod tests {
     fn cron_invalid_chars() {
         let mut job = valid_job();
         job.schedule = CronSchedule::Cron {
-            expr: "0 9 * * MON".into(),
+            expr: "0 9 * * @bogus".into(),
             tz: None,
         };
         let err = job.validate(0).unwrap_err();
         assert!(err.contains("invalid characters"), "{err}");
+    }
+
+    #[test]
+    fn cron_quartz_extension_rejected() {
+        for token in ["L", "MON#1", "15W"] {
+            let mut job = valid_job();
+            job.schedule = CronSchedule::Cron {
+                expr: format!("0 9 * * {token}"),
+                tz: None,
+            };
+            let err = job.validate(0).unwrap_err();
+            assert!(err.contains("Quartz"), "{err}");
+        }
+    }
+
+    #[test]
+    fn cron_dow_zero_means_sunday() {
+        // Vixie Sunday=0 must validate.
+        let mut job = valid_job();
+        job.schedule = CronSchedule::Cron {
+            expr: "0 2 * * 0".into(),
+            tz: None,
+        };
+        assert!(job.validate(0).is_ok());
+    }
+
+    #[test]
+    fn cron_dow_seven_means_sunday() {
+        // Alt Sunday=7 must also validate (was silently Saturday in cron-0.16).
+        let mut job = valid_job();
+        job.schedule = CronSchedule::Cron {
+            expr: "0 2 * * 7".into(),
+            tz: None,
+        };
+        assert!(job.validate(0).is_ok());
+    }
+
+    #[test]
+    fn cron_named_dow_ok() {
+        let mut job = valid_job();
+        job.schedule = CronSchedule::Cron {
+            expr: "0 9 * * MON-FRI".into(),
+            tz: None,
+        };
+        assert!(job.validate(0).is_ok());
+    }
+
+    #[test]
+    fn cron_out_of_range_rejected() {
+        let mut job = valid_job();
+        job.schedule = CronSchedule::Cron {
+            expr: "0 25 * * 1".into(),
+            tz: None,
+        };
+        let err = job.validate(0).unwrap_err();
+        assert!(err.contains("failed to parse"), "{err}");
+    }
+
+    #[test]
+    fn normalize_cron_dow_examples() {
+        use std::borrow::Cow;
+        // Vixie Sunday=0 -> cron-0.16 Sun=1
+        assert_eq!(
+            normalize_cron_dow("0 2 * * 0"),
+            Cow::<str>::Owned("0 2 * * 1".into())
+        );
+        // Alt Sunday=7 -> cron-0.16 Sun=1
+        assert_eq!(
+            normalize_cron_dow("0 2 * * 7"),
+            Cow::<str>::Owned("0 2 * * 1".into())
+        );
+        // No DOW change -> borrowed
+        let star = normalize_cron_dow("0 2 * * *");
+        assert!(matches!(star, Cow::Borrowed(_)));
+        // Range with step Vixie {Sun=0, Tue=2, Thu=4, Sat=6} by 2 ->
+        // cron-0.16 {Sun=1, Tue=3, Thu=5, Sat=7}.
+        assert_eq!(
+            normalize_cron_dow("0 2 * * 0-6/2"),
+            Cow::<str>::Owned("0 2 * * 1,3,5,7".into())
+        );
+        // List with Vixie Sun=0 and Wed=3 -> cron-0.16 {1, 4}
+        assert_eq!(
+            normalize_cron_dow("0 2 * * 0,3"),
+            Cow::<str>::Owned("0 2 * * 1,4".into())
+        );
+        // Vixie Mon-Fri (1-5) -> cron-0.16 (2-6)
+        assert_eq!(
+            normalize_cron_dow("0 9 * * 1-5"),
+            Cow::<str>::Owned("0 9 * * 2,3,4,5,6".into())
+        );
     }
 
     // -- Action: SystemEvent --

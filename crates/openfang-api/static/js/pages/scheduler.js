@@ -123,9 +123,41 @@ function schedulerPage() {
           next_run: j.next_run,
           delivery: j.delivery ? j.delivery.kind || '' : '',
           delivery_targets: Array.isArray(j.delivery_targets) ? j.delivery_targets : [],
-          created_at: j.created_at
+          created_at: j.created_at,
+          consecutive_errors: typeof j.consecutive_errors === 'number' ? j.consecutive_errors : 0,
+          last_status: j.last_status || null,
+          skip_count: typeof j.skip_count === 'number' ? j.skip_count : 0,
+          auto_disabled: !!j.auto_disabled
         };
       });
+    },
+
+    statusLabel(job) {
+      if (job.auto_disabled) {
+        var msg = job.last_status || 'auto-disabled';
+        return 'Auto-disabled: ' + (msg.length > 60 ? msg.slice(0, 57) + '...' : msg);
+      }
+      if (!job.enabled) return 'Paused';
+      return 'Active';
+    },
+
+    statusClass(job) {
+      if (job.auto_disabled) return 'badge-danger';
+      if (!job.enabled) return 'badge-muted';
+      return 'badge-success';
+    },
+
+    autoDisabledCount() {
+      return (this.jobs || []).filter(function(j) { return j.auto_disabled; }).length;
+    },
+
+    async reEnable(jobId) {
+      try {
+        await OpenFangAPI.put('/api/cron/jobs/' + jobId + '/enable', { enabled: true });
+        await this.loadJobs();
+      } catch (e) {
+        this.error = 'Re-enable failed: ' + (e.message || e);
+      }
     },
 
     async loadTriggers() {

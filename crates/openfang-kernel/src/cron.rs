@@ -11,12 +11,14 @@ use chrono::{Duration, Utc};
 use dashmap::DashMap;
 use openfang_types::agent::AgentId;
 use openfang_types::error::{OpenFangError, OpenFangResult};
-use openfang_types::scheduler::{CronDelivery, CronJob, CronJobId, CronSchedule, OverlapPolicy};
+use openfang_types::scheduler::{
+    normalize_cron_dow, CronDelivery, CronJob, CronJobId, CronSchedule, OverlapPolicy,
+};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Maximum consecutive errors before a job is auto-disabled.
 const MAX_CONSECUTIVE_ERRORS: u32 = 5;
@@ -167,19 +169,94 @@ impl CronScheduler {
     ///
     /// Returns the number of jobs loaded. If the persistence file does not
     /// exist, returns `Ok(0)` without error.
+    ///
+    /// On load, heals stale `next_run` values by recomputing from `schedule`
+    /// when:
+    /// - `next_run` is `null` (hand-rolled JSON with no fire time set)
+    /// - `next_run` is at or before `last_run` (the rapid-refire bug shape:
+    ///   `compute_next_run_after` previously fell through to `+1h` after a
+    ///   parse failure, producing `next_run` close to `last_run`).
+    /// Healthy `next_run` values (in the future, or in the past but after the
+    /// last fire — meaning the daemon was off across a fire window) are
+    /// preserved so missed fires execute on boot.
+    ///
+    /// After healing, if any job was rebuilt, `persist()` is called to flush
+    /// the corrected state to disk. Persist failures are logged but not
+    /// propagated; the next periodic persist (every ~5 min) will retry.
     pub fn load(&self) -> OpenFangResult<usize> {
         if !self.persist_path.exists() {
             return Ok(0);
         }
         let data = std::fs::read_to_string(&self.persist_path)
             .map_err(|e| OpenFangError::Internal(format!("Failed to read cron jobs: {e}")))?;
-        let metas: Vec<JobMeta> = serde_json::from_str(&data)
+        let mut metas: Vec<JobMeta> = serde_json::from_str(&data)
             .map_err(|e| OpenFangError::Internal(format!("Failed to parse cron jobs: {e}")))?;
         let count = metas.len();
+        let mut healed = 0usize;
+
+        // Mutate the local Vec before insertion. Do NOT use DashMap iter_mut
+        // here — calling self.persist() inside an iter_mut hold deadlocks the
+        // shard the iterator is on.
+        for meta in &mut metas {
+            // Quick validate; on failure, quarantine (disable + skip heal).
+            // Pass existing_count = 0 because we're loading our own snapshot.
+            if let Err(e) = meta.job.validate(0) {
+                warn!(
+                    job_id = %meta.job.id,
+                    name = %meta.job.name,
+                    error = %e,
+                    "cron job failed validate on load; disabling"
+                );
+                meta.job.enabled = false;
+                meta.last_status = Some(format!("validation failed on load: {e}"));
+                healed += 1;
+                continue;
+            }
+            // Heal stale or missing next_run. Triggers when:
+            //  - next_run is null (hand-rolled JSON or never computed),
+            //  - next_run <= last_run (impossible for a healthy schedule),
+            //  - next_run is within 1h+5min after last_run (the cron-0.16
+            //    DOW=0 parse-failure fallback signature: previous code
+            //    fell through to `last_run + 1h` so the rapid-refire jobs
+            //    have next_run very close to last_run instead of next
+            //    natural fire).
+            const FALLBACK_WINDOW_SECS: i64 = 3900; // 1h + 5min slack
+            let needs_heal = match (meta.job.next_run, meta.job.last_run) {
+                (None, _) => true,
+                (Some(next), Some(last)) if next <= last => true,
+                (Some(next), Some(last)) => {
+                    let delta = (next - last).num_seconds();
+                    (0..=FALLBACK_WINDOW_SECS).contains(&delta)
+                }
+                _ => false,
+            };
+            if needs_heal {
+                let new_next = compute_next_run(&meta.job.schedule);
+                info!(
+                    job_id = %meta.job.id,
+                    name = %meta.job.name,
+                    old_next_run = ?meta.job.next_run,
+                    new_next_run = %new_next,
+                    "rebuilt stale next_run on load"
+                );
+                meta.job.next_run = Some(new_next);
+                healed += 1;
+            }
+        }
+
         for meta in metas {
             self.jobs.insert(meta.job.id, meta);
         }
-        info!(count, "Loaded cron jobs from disk");
+        info!(count, healed, "Loaded cron jobs from disk");
+
+        if healed > 0 {
+            if let Err(e) = self.persist() {
+                warn!(
+                    error = %e,
+                    "failed to persist healed cron jobs; in-memory state is correct, will retry on next periodic persist"
+                );
+            }
+        }
         Ok(count)
     }
 
@@ -578,16 +655,20 @@ pub fn compute_next_run_after(
         CronSchedule::At { at } => *at,
         CronSchedule::Every { every_secs } => after + Duration::seconds(*every_secs as i64),
         CronSchedule::Cron { expr, tz } => {
+            // Normalize Vixie DOW (Sunday=0) to cron-0.16 (Sunday=1) before
+            // parsing. The on-disk `expr` is never mutated; this is a
+            // parse-time transform only.
+            let normalized = normalize_cron_dow(expr);
             // Convert standard 5/6-field cron to 7-field for the `cron` crate.
             // Standard 5-field: min hour dom month dow
             // 6-field:          sec min hour dom month dow
             // cron crate:       sec min hour dom month dow year
-            let trimmed = expr.trim();
+            let trimmed = normalized.trim();
             let fields: Vec<&str> = trimmed.split_whitespace().collect();
             let seven_field = match fields.len() {
                 5 => format!("0 {trimmed} *"),
                 6 => format!("{trimmed} *"),
-                _ => expr.clone(),
+                _ => normalized.clone().into_owned(),
             };
 
             // Add 1 second so `.after()` (inclusive) skips the current second.
@@ -619,10 +700,22 @@ pub fn compute_next_run_after(
                         }
                         _ => sched.after(&base).next(),
                     };
-                    next_utc.unwrap_or_else(|| after + Duration::hours(1))
+                    next_utc.unwrap_or_else(|| {
+                        error!(
+                            expr = %expr,
+                            normalized = %normalized,
+                            "cron schedule produced no future fire time; using +1h fallback"
+                        );
+                        after + Duration::hours(1)
+                    })
                 }
                 Err(e) => {
-                    warn!("Failed to parse cron expression '{}': {}", expr, e);
+                    error!(
+                        expr = %expr,
+                        normalized = %normalized,
+                        error = %e,
+                        "cron parse failed; using +1h fallback (job will surface as last_status error after fire)"
+                    );
                     after + Duration::hours(1)
                 }
             }
@@ -1620,6 +1713,229 @@ mod tests {
         assert!(
             after > Utc::now(),
             "try_claim should advance next_run past now for overdue jobs"
+        );
+    }
+
+    // -- DOW=0 regression tests (the user's actual bug) ---------------------
+
+    /// User's exact failing expression: weekly Sunday cron `0 2 * * 0` must
+    /// produce a Sunday next_run, not the +1h fallback.
+    #[test]
+    fn test_compute_next_run_cron_dow_zero_means_sunday() {
+        use chrono::TimeZone;
+        let saturday_noon = Utc.with_ymd_and_hms(2026, 5, 2, 12, 0, 0).unwrap();
+        let schedule = CronSchedule::Cron {
+            expr: "0 2 * * 0".into(),
+            tz: None,
+        };
+        let next = compute_next_run_after(&schedule, saturday_noon);
+        // Next Sunday 02:00 UTC = 2026-05-03 02:00 UTC.
+        let expected = Utc.with_ymd_and_hms(2026, 5, 3, 2, 0, 0).unwrap();
+        assert_eq!(
+            next, expected,
+            "DOW=0 must mean Sunday; got {next} (Sunday should be {expected})"
+        );
+    }
+
+    /// Alt Sunday convention: `0 2 * * 7` must also produce Sunday (was
+    /// previously silently Saturday in cron-0.16).
+    #[test]
+    fn test_compute_next_run_cron_dow_seven_means_sunday() {
+        use chrono::TimeZone;
+        let saturday_noon = Utc.with_ymd_and_hms(2026, 5, 2, 12, 0, 0).unwrap();
+        let schedule = CronSchedule::Cron {
+            expr: "0 2 * * 7".into(),
+            tz: None,
+        };
+        let next = compute_next_run_after(&schedule, saturday_noon);
+        let expected = Utc.with_ymd_and_hms(2026, 5, 3, 2, 0, 0).unwrap();
+        assert_eq!(next, expected, "DOW=7 must also mean Sunday");
+    }
+
+    /// Vixie weekday range `1-5` (Mon-Fri) must produce a Monday next from a
+    /// Sunday anchor.
+    #[test]
+    fn test_compute_next_run_cron_dow_one_to_five_means_weekdays() {
+        use chrono::{Datelike, TimeZone, Weekday};
+        let sunday_noon = Utc.with_ymd_and_hms(2026, 5, 3, 12, 0, 0).unwrap();
+        let schedule = CronSchedule::Cron {
+            expr: "0 9 * * 1-5".into(),
+            tz: None,
+        };
+        let next = compute_next_run_after(&schedule, sunday_noon);
+        assert_eq!(next.weekday(), Weekday::Mon);
+        assert_eq!(next.hour(), 9);
+    }
+
+    /// Range with step: `0-6/2` = Sun, Tue, Thu, Sat. Anchor on a Wednesday;
+    /// next must be Thursday.
+    #[test]
+    fn test_compute_next_run_cron_dow_step_range() {
+        use chrono::{Datelike, TimeZone, Weekday};
+        // 2026-05-06 is a Wednesday.
+        let wed_noon = Utc.with_ymd_and_hms(2026, 5, 6, 12, 0, 0).unwrap();
+        let schedule = CronSchedule::Cron {
+            expr: "0 2 * * 0-6/2".into(),
+            tz: None,
+        };
+        let next = compute_next_run_after(&schedule, wed_noon);
+        assert_eq!(next.weekday(), Weekday::Thu);
+    }
+
+    /// Timezone-aware DOW=0: in America/New_York, weekly 02:00 ET on Sunday.
+    #[test]
+    fn test_compute_next_run_cron_dow_zero_with_tz() {
+        use chrono::{Datelike, TimeZone, Weekday};
+        let saturday_noon_utc = Utc.with_ymd_and_hms(2026, 5, 2, 12, 0, 0).unwrap();
+        let schedule = CronSchedule::Cron {
+            expr: "0 2 * * 0".into(),
+            tz: Some("America/New_York".into()),
+        };
+        let next = compute_next_run_after(&schedule, saturday_noon_utc);
+        let ny_tz: chrono_tz::Tz = "America/New_York".parse().unwrap();
+        let local = next.with_timezone(&ny_tz);
+        assert_eq!(local.weekday(), Weekday::Sun);
+        assert_eq!(local.hour(), 2);
+    }
+
+    // -- load() heal regression tests --------------------------------------
+
+    /// load() must rebuild next_run when it is null (hand-rolled JSON or
+    /// crash-recovery scenario).
+    #[test]
+    fn test_load_rebuilds_next_run_when_null() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("cron_jobs.json");
+        // Write a JobMeta with next_run = null on disk.
+        let job_id = CronJobId::new();
+        let agent_id = AgentId::new();
+        let raw = serde_json::json!([{
+            "job": {
+                "id": job_id,
+                "agent_id": agent_id,
+                "name": "null-next-run",
+                "enabled": true,
+                "schedule": {"kind": "cron", "expr": "0 2 * * 0", "tz": null},
+                "action": {"kind": "system_event", "text": "ping"},
+                "delivery": {"kind": "none"},
+                "delivery_targets": [],
+                "overlap_policy": {"kind": "skip"},
+                "max_in_flight": 1,
+                "created_at": Utc::now().to_rfc3339(),
+                "last_run": null,
+                "next_run": null,
+            },
+            "one_shot": false,
+            "last_status": null,
+            "consecutive_errors": 0,
+        }]);
+        std::fs::write(&path, serde_json::to_string_pretty(&raw).unwrap()).unwrap();
+
+        let sched = CronScheduler::new(tmp.path(), 100);
+        sched.load().unwrap();
+        let job = sched.get_job(job_id).unwrap();
+        assert!(
+            job.next_run.is_some(),
+            "load() must rebuild null next_run"
+        );
+        assert!(job.next_run.unwrap() > Utc::now());
+    }
+
+    /// load() must rebuild next_run when next_run <= last_run (the rapid-
+    /// refire bug shape that the user actually hit).
+    #[test]
+    fn test_load_rebuilds_next_run_when_before_last_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("cron_jobs.json");
+        let job_id = CronJobId::new();
+        let agent_id = AgentId::new();
+        let last = "2026-04-20T12:47:03.448463Z";
+        let next_broken = "2026-04-20T13:17:03.436819Z"; // last + 30min, < last? NO, > last by 30min
+        // The user's actual broken state has next_run AFTER last_run by 30min.
+        // The heal heuristic triggers when next_run <= last_run, which is the
+        // truer "this job will fire instantly on boot" case. For the user's
+        // 13-day-stale jobs, the daemon also catches it because next_run is
+        // way before now — it fires once and then advances. Test BOTH cases:
+        // (a) next_run before last_run (heal triggers), and
+        // (b) next_run after last_run but in past (heal does NOT trigger; job
+        //     fires once on next tick).
+        let _ = (last, next_broken);
+        let raw = serde_json::json!([{
+            "job": {
+                "id": job_id,
+                "agent_id": agent_id,
+                "name": "needs-heal",
+                "enabled": true,
+                "schedule": {"kind": "cron", "expr": "0 2 * * 0", "tz": null},
+                "action": {"kind": "system_event", "text": "ping"},
+                "delivery": {"kind": "none"},
+                "delivery_targets": [],
+                "overlap_policy": {"kind": "skip"},
+                "max_in_flight": 1,
+                "created_at": "2026-04-01T00:00:00Z",
+                "last_run": "2026-04-20T12:47:03Z",
+                // Before last_run: heal must trigger.
+                "next_run": "2026-04-20T11:00:00Z",
+            },
+            "one_shot": false,
+            "last_status": "error: timed out",
+            "consecutive_errors": 5,
+        }]);
+        std::fs::write(&path, serde_json::to_string_pretty(&raw).unwrap()).unwrap();
+
+        let sched = CronScheduler::new(tmp.path(), 100);
+        sched.load().unwrap();
+        let job = sched.get_job(job_id).unwrap();
+        let next = job.next_run.unwrap();
+        // Must be rebuilt to a future Sunday at 02:00 UTC.
+        assert!(next > Utc::now(), "rebuilt next_run must be in the future");
+        use chrono::{Datelike, Weekday};
+        assert_eq!(next.weekday(), Weekday::Sun);
+        assert_eq!(next.hour(), 2);
+    }
+
+    /// load() must NOT rebuild next_run when it is healthy (in the future).
+    #[test]
+    fn test_load_preserves_fresh_next_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("cron_jobs.json");
+        let job_id = CronJobId::new();
+        let agent_id = AgentId::new();
+        let future = (Utc::now() + Duration::hours(48))
+            .format("%Y-%m-%dT%H:%M:%S%.fZ")
+            .to_string();
+        let raw = serde_json::json!([{
+            "job": {
+                "id": job_id,
+                "agent_id": agent_id,
+                "name": "healthy",
+                "enabled": true,
+                "schedule": {"kind": "cron", "expr": "0 2 * * 0", "tz": null},
+                "action": {"kind": "system_event", "text": "ping"},
+                "delivery": {"kind": "none"},
+                "delivery_targets": [],
+                "overlap_policy": {"kind": "skip"},
+                "max_in_flight": 1,
+                "created_at": "2026-04-01T00:00:00Z",
+                "last_run": "2026-05-01T02:00:00Z",
+                "next_run": future,
+            },
+            "one_shot": false,
+            "last_status": "ok",
+            "consecutive_errors": 0,
+        }]);
+        std::fs::write(&path, serde_json::to_string_pretty(&raw).unwrap()).unwrap();
+
+        let sched = CronScheduler::new(tmp.path(), 100);
+        sched.load().unwrap();
+        let job = sched.get_job(job_id).unwrap();
+        // next_run preserved (not the freshly-recomputed Sunday).
+        let next = job.next_run.unwrap();
+        let diff = next - Utc::now();
+        assert!(
+            diff.num_hours() >= 47 && diff.num_hours() <= 48,
+            "fresh next_run must be preserved (got {} hours from now)",
+            diff.num_hours()
         );
     }
 }

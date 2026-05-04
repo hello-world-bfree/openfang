@@ -10968,7 +10968,36 @@ pub async fn list_cron_jobs(
     let total = jobs.len();
     let jobs_json: Vec<serde_json::Value> = jobs
         .into_iter()
-        .map(|j| serde_json::to_value(&j).unwrap_or_default())
+        .map(|j| {
+            // Enrich with JobMeta fields (consecutive_errors, last_status,
+            // skip_count) so the dashboard can surface auto-disabled state.
+            let meta = state.kernel.cron_scheduler.get_meta(j.id);
+            let mut v = serde_json::to_value(&j).unwrap_or_default();
+            if let (serde_json::Value::Object(ref mut obj), Some(m)) = (&mut v, meta) {
+                obj.insert(
+                    "consecutive_errors".into(),
+                    serde_json::Value::from(m.consecutive_errors),
+                );
+                obj.insert(
+                    "last_status".into(),
+                    match m.last_status {
+                        Some(s) => serde_json::Value::String(s),
+                        None => serde_json::Value::Null,
+                    },
+                );
+                obj.insert(
+                    "skip_count".into(),
+                    serde_json::Value::from(
+                        m.skip_count.load(std::sync::atomic::Ordering::Acquire),
+                    ),
+                );
+                obj.insert(
+                    "auto_disabled".into(),
+                    serde_json::Value::Bool(!j.enabled && m.consecutive_errors >= 5),
+                );
+            }
+            v
+        })
         .collect();
     (
         StatusCode::OK,
