@@ -24,6 +24,54 @@ pub struct ToolCall {
     pub input: serde_json::Value,
 }
 
+/// Machine-readable failure class for a tool error.
+///
+/// Gives the model a typed signal to re-plan on instead of pattern-matching a
+/// free-text string: a `Timeout` is worth retrying, an `InvalidParam` means fix
+/// the arguments, an `EmptyResult` means rephrase. Mirrors the tool-result-shaping
+/// "Tried But Failed" schema. Serializes to a stable SCREAMING_SNAKE code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ErrorCode {
+    /// Operation exceeded its time budget. Retry may succeed.
+    Timeout,
+    /// Arguments were malformed or failed validation. Fix args; do not retry as-is.
+    InvalidParam,
+    /// Upstream rate limit hit. Back off, then retry.
+    RateLimited,
+    /// Target resource does not exist. Do not retry with the same target.
+    NotFound,
+    /// Call succeeded but produced no usable data. Rephrase or try a different source.
+    EmptyResult,
+    /// A required dependency/backend is unavailable. Retry later or route around it.
+    DepDown,
+    /// Blocked by capability, approval, or policy. Do not retry without authorization.
+    Denied,
+}
+
+impl ErrorCode {
+    /// The stable wire string for this code (matches the serde representation).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ErrorCode::Timeout => "TIMEOUT",
+            ErrorCode::InvalidParam => "INVALID_PARAM",
+            ErrorCode::RateLimited => "RATE_LIMITED",
+            ErrorCode::NotFound => "NOT_FOUND",
+            ErrorCode::EmptyResult => "EMPTY_RESULT",
+            ErrorCode::DepDown => "DEP_DOWN",
+            ErrorCode::Denied => "DENIED",
+        }
+    }
+
+    /// Whether retrying the identical call could plausibly succeed.
+    pub fn is_retryable(self) -> bool {
+        matches!(
+            self,
+            ErrorCode::Timeout | ErrorCode::RateLimited | ErrorCode::DepDown
+        )
+    }
+}
+
 /// Result of a tool execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolResult {
@@ -33,6 +81,257 @@ pub struct ToolResult {
     pub content: String,
     /// Whether the tool execution resulted in an error.
     pub is_error: bool,
+    /// Typed failure class when `is_error` is true. `None` for success or for
+    /// untyped errors. Defaulted for backward-compatible deserialization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<ErrorCode>,
+    /// Suggested seconds to wait before retrying, when the error is retryable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after_seconds: Option<u64>,
+}
+
+impl ToolResult {
+    /// A successful result.
+    pub fn ok(tool_use_id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            tool_use_id: tool_use_id.into(),
+            content: content.into(),
+            is_error: false,
+            error_code: None,
+            retry_after_seconds: None,
+        }
+    }
+
+    /// An untyped error result (no machine-readable code).
+    pub fn error(tool_use_id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            tool_use_id: tool_use_id.into(),
+            content: content.into(),
+            is_error: true,
+            error_code: None,
+            retry_after_seconds: None,
+        }
+    }
+
+    /// A typed error result. Renders a small structured header the model can
+    /// parse, then the human-readable detail.
+    pub fn error_coded(
+        tool_use_id: impl Into<String>,
+        code: ErrorCode,
+        summary: impl Into<String>,
+    ) -> Self {
+        let summary = summary.into();
+        let retry_after_seconds = if code.is_retryable() {
+            Some(default_retry_after(code))
+        } else {
+            None
+        };
+        let content = format_error_block(code, &summary, retry_after_seconds);
+        Self {
+            tool_use_id: tool_use_id.into(),
+            content,
+            is_error: true,
+            error_code: Some(code),
+            retry_after_seconds,
+        }
+    }
+}
+
+fn default_retry_after(code: ErrorCode) -> u64 {
+    match code {
+        ErrorCode::RateLimited => 5,
+        ErrorCode::Timeout => 2,
+        ErrorCode::DepDown => 10,
+        _ => 0,
+    }
+}
+
+/// Render the typed failure as a compact block the LLM can act on.
+fn format_error_block(code: ErrorCode, summary: &str, retry_after: Option<u64>) -> String {
+    let mut block = format!("error_code: {}\nhuman_summary: {}", code.as_str(), summary);
+    if let Some(secs) = retry_after {
+        block.push_str(&format!("\nretry_after_seconds: {secs}"));
+    }
+    block
+}
+
+/// What externally-visible effect a tool has when it runs.
+///
+/// Drives the approval gate (Privileged/Mutating require a human OK), idempotency
+/// (Mutating tools get a dedup key), and parallel fan-out eligibility (only `None`
+/// reads are safe to run concurrently). Conservative by default: anything not
+/// explicitly classified is treated as the least-privilege read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SideEffect {
+    /// Pure read — no state change, safe to run in parallel. The default.
+    #[default]
+    None,
+    /// Mutates local/agent state (writes a file, stores memory, posts a task).
+    Mutating,
+    /// Calls out to an external service (network, another agent, a webhook).
+    ExternalCall,
+    /// Privileged/dangerous (shell, docker, process spawn) — always gated.
+    Privileged,
+}
+
+impl SideEffect {
+    /// Whether this effect class must pass the human-approval gate.
+    pub fn requires_approval(self) -> bool {
+        matches!(self, SideEffect::Privileged)
+    }
+
+    /// Whether a tool with this effect is a pure read (parallel-safe).
+    pub fn is_read_only(self) -> bool {
+        matches!(self, SideEffect::None)
+    }
+
+    /// Whether a retried call could re-apply an unwanted side effect (needs an
+    /// idempotency key).
+    pub fn is_mutating(self) -> bool {
+        matches!(self, SideEffect::Mutating | SideEffect::Privileged)
+    }
+}
+
+/// Coarse risk classification, independent of effect class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RiskTier {
+    /// Low blast radius (reads, idempotent lookups). The default.
+    #[default]
+    Low,
+    /// Moderate (single-resource writes, external lookups).
+    Medium,
+    /// High (shell/exec, destructive or irreversible operations).
+    High,
+}
+
+/// Machine-readable behavior tags for a tool, looked up by name.
+///
+/// Kept as a side table rather than fields on [`ToolDefinition`] so the ~140
+/// existing `ToolDefinition { .. }` construction sites (built-ins, MCP, skills,
+/// drivers) need no change, while the gate and scheduler get a single, testable
+/// inventory point. JSON-sourced tools (MCP/skill) that aren't in the table fall
+/// back to the conservative default via [`tool_metadata`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolMeta {
+    pub side_effects: SideEffect,
+    pub idempotent: bool,
+    pub risk_tier: RiskTier,
+}
+
+impl Default for ToolMeta {
+    fn default() -> Self {
+        // Unknown tools default to least-privilege: a non-idempotent external
+        // call would be the unsafe assumption, so we assume a safe read but mark
+        // it non-idempotent only when mutating. A pure read is idempotent.
+        Self {
+            side_effects: SideEffect::None,
+            idempotent: true,
+            risk_tier: RiskTier::Low,
+        }
+    }
+}
+
+impl ToolMeta {
+    const fn new(side_effects: SideEffect, idempotent: bool, risk_tier: RiskTier) -> Self {
+        Self {
+            side_effects,
+            idempotent,
+            risk_tier,
+        }
+    }
+}
+
+/// Look up behavior tags for a built-in tool by name.
+///
+/// The match is the single source of truth for which tools mutate, call out, or
+/// are privileged. Unknown names (MCP/skill tools) get the conservative default:
+/// a tool the gate doesn't recognize is treated as a non-privileged read, so it
+/// is neither force-gated nor wrongly assumed idempotent-when-mutating.
+pub fn tool_metadata(name: &str) -> ToolMeta {
+    use RiskTier::{High, Low, Medium};
+    use SideEffect::{ExternalCall, Mutating, None as NoEffect, Privileged};
+    match name {
+        // --- Pure reads (parallel-safe, idempotent) ---
+        "file_read" | "file_list" | "code_search" | "system_time" | "location_get"
+        | "memory_recall" | "agent_list" | "agent_status" | "agent_find" | "task_list"
+        | "schedule_list" | "cron_list" | "knowledge_query" | "process_poll" | "process_list"
+        | "hand_list" | "hand_status" | "browser_read_page" | "browser_screenshot" => {
+            ToolMeta::new(NoEffect, true, Low)
+        }
+
+        // --- Local mutations (need idempotency key) ---
+        "file_write" | "apply_patch" | "memory_store" | "knowledge_add_entity"
+        | "knowledge_add_relation" | "task_post" | "task_claim" | "task_complete"
+        | "schedule_create" | "schedule_delete" | "cron_create" | "cron_cancel"
+        | "hand_activate" | "hand_deactivate" | "image_generate" | "text_to_speech" => {
+            ToolMeta::new(Mutating, false, Medium)
+        }
+
+        // --- External calls (network / other agents / outbound) ---
+        "web_fetch" | "web_search" | "agent_send" | "event_publish" | "channel_send"
+        | "a2a_discover" | "a2a_send" | "image_analyze" | "media_describe"
+        | "media_transcribe" | "speech_to_text" => ToolMeta::new(ExternalCall, false, Medium),
+
+        // Browser navigation/interaction = external + mutating-ish session state.
+        "browser_navigate" | "browser_click" | "browser_type" | "browser_scroll"
+        | "browser_wait" | "browser_back" | "browser_run_js" | "browser_close"
+        | "canvas_present" => ToolMeta::new(ExternalCall, false, Medium),
+
+        // --- Privileged / dangerous (always gated, high risk) ---
+        "shell_exec" | "docker_exec" | "process_start" | "process_write" | "process_kill"
+        | "agent_spawn" | "agent_kill" | "code_agent_spawn" => {
+            ToolMeta::new(Privileged, false, High)
+        }
+
+        // Unknown (MCP/skill/etc.) → conservative default.
+        _ => ToolMeta::default(),
+    }
+}
+
+/// Canonical idempotency key for a (possibly retried) tool call.
+///
+/// `sha256(tool_name + "|" + canonical_json(args))` per tool-design §7. Mutating
+/// tools use this to dedup a retried/duplicated call so the side effect is not
+/// re-applied (failure #20). Returns `None` for non-mutating tools, which don't
+/// need one.
+pub fn make_idempotency_key(name: &str, args: &serde_json::Value) -> Option<String> {
+    if !tool_metadata(name).side_effects.is_mutating() {
+        return None;
+    }
+    Some(idempotency_hash(name, args))
+}
+
+fn idempotency_hash(name: &str, args: &serde_json::Value) -> String {
+    use sha2::{Digest, Sha256};
+    // Canonicalize args so key ordering doesn't change the key.
+    let canonical = canonical_json(args);
+    let mut hasher = Sha256::new();
+    hasher.update(name.as_bytes());
+    hasher.update(b"|");
+    hasher.update(canonical.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+/// Serialize JSON with object keys sorted, so semantically-equal args hash equal.
+fn canonical_json(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut entries: Vec<_> = map.iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+            let inner: Vec<String> = entries
+                .iter()
+                .map(|(k, v)| format!("{}:{}", serde_json::to_string(k).unwrap(), canonical_json(v)))
+                .collect();
+            format!("{{{}}}", inner.join(","))
+        }
+        serde_json::Value::Array(arr) => {
+            let inner: Vec<String> = arr.iter().map(canonical_json).collect();
+            format!("[{}]", inner.join(","))
+        }
+        other => other.to_string(),
+    }
 }
 
 /// Normalize a JSON Schema for cross-provider compatibility.
@@ -290,6 +589,111 @@ fn try_flatten_any_of(any_of: &serde_json::Value) -> Option<Vec<(String, serde_j
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_tool_metadata_classifies_known_tools() {
+        // Reads are parallel-safe and idempotent.
+        let r = tool_metadata("file_read");
+        assert_eq!(r.side_effects, SideEffect::None);
+        assert!(r.side_effects.is_read_only());
+        assert!(r.idempotent);
+
+        // Mutations are gated for idempotency, not read-only.
+        let w = tool_metadata("file_write");
+        assert_eq!(w.side_effects, SideEffect::Mutating);
+        assert!(w.side_effects.is_mutating());
+        assert!(!w.idempotent);
+
+        // Privileged tools require approval.
+        let s = tool_metadata("shell_exec");
+        assert_eq!(s.side_effects, SideEffect::Privileged);
+        assert!(s.side_effects.requires_approval());
+        assert_eq!(s.risk_tier, RiskTier::High);
+
+        // Unknown tools get the conservative read default (not force-gated).
+        let u = tool_metadata("some_mcp_tool_xyz");
+        assert_eq!(u, ToolMeta::default());
+        assert!(!u.side_effects.requires_approval());
+    }
+
+    #[test]
+    fn test_no_mutating_tool_lacks_idempotency_path() {
+        // Every mutating/privileged built-in must produce an idempotency key;
+        // every read must not. This is the invariant Fix 6 relies on.
+        let mutating = ["file_write", "memory_store", "shell_exec", "task_post"];
+        for t in mutating {
+            assert!(
+                make_idempotency_key(t, &serde_json::json!({"a": 1})).is_some(),
+                "{t} is mutating but has no idempotency key"
+            );
+        }
+        let reads = ["file_read", "system_time", "memory_recall"];
+        for t in reads {
+            assert!(
+                make_idempotency_key(t, &serde_json::json!({})).is_none(),
+                "{t} is a read but got an idempotency key"
+            );
+        }
+    }
+
+    #[test]
+    fn test_idempotency_key_stable_under_arg_reordering() {
+        // Canonicalization means key order doesn't change the key — a retry with
+        // re-serialized args dedups correctly (failure #20).
+        let a = make_idempotency_key("file_write", &serde_json::json!({"path": "x", "content": "y"}));
+        let b = make_idempotency_key("file_write", &serde_json::json!({"content": "y", "path": "x"}));
+        assert!(a.is_some());
+        assert_eq!(a, b);
+        // Different args → different key.
+        let c = make_idempotency_key("file_write", &serde_json::json!({"path": "z", "content": "y"}));
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn test_error_coded_timeout_carries_retry() {
+        let r = ToolResult::error_coded("tu1", ErrorCode::Timeout, "command timed out");
+        assert!(r.is_error);
+        assert_eq!(r.error_code, Some(ErrorCode::Timeout));
+        assert_eq!(r.retry_after_seconds, Some(2));
+        // The content block is parseable by the model.
+        assert!(r.content.contains("error_code: TIMEOUT"));
+        assert!(r.content.contains("retry_after_seconds: 2"));
+        assert!(r.content.contains("human_summary: command timed out"));
+    }
+
+    #[test]
+    fn test_error_coded_invalid_param_no_retry() {
+        let r = ToolResult::error_coded("tu2", ErrorCode::InvalidParam, "missing field 'url'");
+        assert_eq!(r.error_code, Some(ErrorCode::InvalidParam));
+        // Non-retryable classes must not suggest a blind retry.
+        assert_eq!(r.retry_after_seconds, None);
+        assert!(r.content.contains("error_code: INVALID_PARAM"));
+        assert!(!r.content.contains("retry_after_seconds"));
+    }
+
+    #[test]
+    fn test_error_code_retryable_partition() {
+        assert!(ErrorCode::Timeout.is_retryable());
+        assert!(ErrorCode::RateLimited.is_retryable());
+        assert!(ErrorCode::DepDown.is_retryable());
+        assert!(!ErrorCode::InvalidParam.is_retryable());
+        assert!(!ErrorCode::NotFound.is_retryable());
+        assert!(!ErrorCode::Denied.is_retryable());
+    }
+
+    #[test]
+    fn test_tool_result_back_compat_deserialization() {
+        // Old persisted results lack the new fields; they must still deserialize.
+        let legacy = r#"{"tool_use_id":"x","content":"hi","is_error":false}"#;
+        let r: ToolResult = serde_json::from_str(legacy).unwrap();
+        assert!(!r.is_error);
+        assert_eq!(r.error_code, None);
+        assert_eq!(r.retry_after_seconds, None);
+        // Success results don't serialize the optional fields (skip_serializing_if).
+        let out = serde_json::to_string(&ToolResult::ok("x", "hi")).unwrap();
+        assert!(!out.contains("error_code"));
+        assert!(!out.contains("retry_after_seconds"));
+    }
 
     #[test]
     fn test_tool_definition_serialization() {

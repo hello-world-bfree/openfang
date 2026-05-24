@@ -615,6 +615,12 @@ pub fn known_providers() -> &'static [&'static str] {
 mod tests {
     use super::*;
 
+    /// Serializes tests that mutate process-global env vars. Env is shared across
+    /// the whole process, so a test that sets `NVIDIA_API_KEY` and one that
+    /// asserts it is unset will race under the parallel test runner. Hold this
+    /// lock for the duration of any such test.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn test_provider_defaults_groq() {
         let d = provider_defaults("groq").unwrap();
@@ -803,6 +809,7 @@ mod tests {
     #[test]
     fn test_nvidia_provider_with_env_key() {
         // NVIDIA NIM is a known provider — set API key and verify driver creation succeeds.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let unique_key = "test-nvidia-key-12345";
         std::env::set_var("NVIDIA_API_KEY", unique_key);
         let config = DriverConfig {
@@ -822,6 +829,9 @@ mod tests {
     #[test]
     fn test_nvidia_provider_no_key_errors() {
         // NVIDIA NIM provider with no API key should error.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Defend against leakage from a sibling test that sets this var.
+        std::env::remove_var("NVIDIA_API_KEY");
         let config = DriverConfig {
             provider: "nvidia".to_string(),
             api_key: None,

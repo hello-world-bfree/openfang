@@ -2221,6 +2221,16 @@ impl OpenFangKernel {
                     serde_json::Value::String(cc_msg),
                 );
             }
+            // Live context.md is also carried in a user message (not the cached
+            // system prefix) so a changing context.md no longer busts the cache. (#843)
+            if let Some(lc_msg) =
+                openfang_runtime::prompt_builder::build_live_context_message(&prompt_ctx)
+            {
+                manifest.metadata.insert(
+                    "live_context_msg".to_string(),
+                    serde_json::Value::String(lc_msg),
+                );
+            }
         }
 
         let memory = Arc::clone(&self.memory);
@@ -2782,6 +2792,16 @@ impl OpenFangKernel {
                 manifest.metadata.insert(
                     "canonical_context_msg".to_string(),
                     serde_json::Value::String(cc_msg),
+                );
+            }
+            // Live context.md is also carried in a user message (not the cached
+            // system prefix) so a changing context.md no longer busts the cache. (#843)
+            if let Some(lc_msg) =
+                openfang_runtime::prompt_builder::build_live_context_message(&prompt_ctx)
+            {
+                manifest.metadata.insert(
+                    "live_context_msg".to_string(),
+                    serde_json::Value::String(lc_msg),
                 );
             }
         }

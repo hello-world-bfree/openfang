@@ -1,0 +1,23 @@
+{
+  "name": "list_then_read",
+  "description": "List the workspace, then read a specific file. Two ordered reads.",
+  "prompt": "List the files then read notes.txt",
+  "script": [
+    {
+      "tool_calls": [
+        { "name": "file_list", "input": { "path": "." } }
+      ]
+    },
+    {
+      "tool_calls": [
+        { "name": "file_read", "input": { "path": "notes.txt" } }
+      ]
+    },
+    { "text": "Done listing and reading." }
+  ],
+  "expected_tools": [
+    { "name": "file_list", "input": { "path": "." } },
+    { "name": "file_read", "input": { "path": "notes.txt" } }
+  ],
+  "expect_any_error": false
+}

@@ -8,7 +8,7 @@ use crate::mcp;
 use crate::web_search::{parse_ddg_results, WebToolsContext};
 use openfang_skills::registry::SkillRegistry;
 use openfang_types::taint::{TaintLabel, TaintSink, TaintedValue};
-use openfang_types::tool::{ToolDefinition, ToolResult};
+use openfang_types::tool::{ErrorCode, ToolDefinition, ToolResult};
 use openfang_types::tool_compat::normalize_tool_name;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -133,13 +133,13 @@ pub async fn execute_tool(
     if let Some(allowed) = allowed_tools {
         if !allowed.iter().any(|t| t == tool_name) {
             warn!(tool_name, "Capability denied: tool not in allowed list");
-            return ToolResult {
-                tool_use_id: tool_use_id.to_string(),
-                content: format!(
+            return ToolResult::error_coded(
+                tool_use_id,
+                ErrorCode::Denied,
+                format!(
                     "Permission denied: agent does not have capability to use tool '{tool_name}'"
                 ),
-                is_error: true,
-            };
+            );
         }
     }
 
@@ -163,8 +163,17 @@ pub async fn execute_tool(
         );
     }
 
+    // A tool needs approval if EITHER the configured name list flags it OR its
+    // side-effect tag is Privileged. The tag means a newly-added privileged tool
+    // (shell/docker/process/spawn) is gated automatically, without editing the
+    // require_approval list (tool-design §6).
+    let tag_requires_approval =
+        openfang_types::tool::tool_metadata(tool_name).side_effects.requires_approval();
+
     if let Some(kh) = kernel {
-        if !exec_policy_bypasses_approval && kh.requires_approval(tool_name) {
+        if !exec_policy_bypasses_approval
+            && (kh.requires_approval(tool_name) || tag_requires_approval)
+        {
             let agent_id_str = caller_agent_id.unwrap_or("unknown");
             let input_str = input.to_string();
             let summary = format!(
@@ -178,22 +187,22 @@ pub async fn execute_tool(
                 }
                 Ok(false) => {
                     warn!(tool_name, "Approval denied — blocking tool execution");
-                    return ToolResult {
-                        tool_use_id: tool_use_id.to_string(),
-                        content: format!(
+                    return ToolResult::error_coded(
+                        tool_use_id,
+                        ErrorCode::Denied,
+                        format!(
                             "Execution denied: '{}' requires human approval and was denied or timed out. The operation was not performed.",
                             tool_name
                         ),
-                        is_error: true,
-                    };
+                    );
                 }
                 Err(e) => {
                     warn!(tool_name, error = %e, "Approval system error");
-                    return ToolResult {
-                        tool_use_id: tool_use_id.to_string(),
-                        content: format!("Approval system error: {e}"),
-                        is_error: true,
-                    };
+                    return ToolResult::error_coded(
+                        tool_use_id,
+                        ErrorCode::DepDown,
+                        format!("Approval system error: {e}"),
+                    );
                 }
             }
         }
@@ -213,11 +222,11 @@ pub async fn execute_tool(
             // Taint check: block URLs containing secrets/PII from being exfiltrated
             let url = input["url"].as_str().unwrap_or("");
             if let Some(violation) = check_taint_net_fetch(url) {
-                return ToolResult {
-                    tool_use_id: tool_use_id.to_string(),
-                    content: format!("Taint violation: {violation}"),
-                    is_error: true,
-                };
+                return ToolResult::error_coded(
+                    tool_use_id,
+                    ErrorCode::Denied,
+                    format!("Taint violation: {violation}"),
+                );
             }
             let method = input["method"].as_str().unwrap_or("GET");
             let headers = input.get("headers").and_then(|v| v.as_object());
@@ -248,14 +257,14 @@ pub async fn execute_tool(
             // These enable command injection regardless of exec policy.
             if let Some(reason) = crate::subprocess_sandbox::contains_shell_metacharacters(command)
             {
-                return ToolResult {
-                    tool_use_id: tool_use_id.to_string(),
-                    content: format!(
+                return ToolResult::error_coded(
+                    tool_use_id,
+                    ErrorCode::Denied,
+                    format!(
                         "shell_exec blocked: command contains {reason}. \
                          Shell metacharacters are never allowed."
                     ),
-                    is_error: true,
-                };
+                );
             }
 
             // Exec policy enforcement (allowlist / deny / full)
@@ -263,15 +272,15 @@ pub async fn execute_tool(
                 if let Err(reason) =
                     crate::subprocess_sandbox::validate_command_allowlist(command, policy)
                 {
-                    return ToolResult {
-                        tool_use_id: tool_use_id.to_string(),
-                        content: format!(
+                    return ToolResult::error_coded(
+                        tool_use_id,
+                        ErrorCode::Denied,
+                        format!(
                             "shell_exec blocked: {reason}. Current exec_policy.mode = '{:?}'. \
                              To allow shell commands, set exec_policy.mode = 'full' in the agent manifest or config.toml.",
                             policy.mode
                         ),
-                        is_error: true,
-                    };
+                    );
                 }
             }
             // Skip heuristic taint patterns for Full exec policy (e.g. hand agents that need curl)
@@ -279,11 +288,11 @@ pub async fn execute_tool(
                 .is_some_and(|p| p.mode == openfang_types::config::ExecSecurityMode::Full);
             if !is_full_exec {
                 if let Some(violation) = check_taint_shell_exec(command) {
-                    return ToolResult {
-                        tool_use_id: tool_use_id.to_string(),
-                        content: format!("Taint violation: {violation}"),
-                        is_error: true,
-                    };
+                    return ToolResult::error_coded(
+                        tool_use_id,
+                        ErrorCode::Denied,
+                        format!("Taint violation: {violation}"),
+                    );
                 }
             }
             tool_shell_exec(
@@ -383,11 +392,11 @@ pub async fn execute_tool(
         "browser_navigate" => {
             let url = input["url"].as_str().unwrap_or("");
             if let Some(violation) = check_taint_net_fetch(url) {
-                return ToolResult {
-                    tool_use_id: tool_use_id.to_string(),
-                    content: format!("Taint violation: {violation}"),
-                    is_error: true,
-                };
+                return ToolResult::error_coded(
+                    tool_use_id,
+                    ErrorCode::Denied,
+                    format!("Taint violation: {violation}"),
+                );
             }
             match browser_ctx {
                 Some(mgr) => {
@@ -548,16 +557,51 @@ pub async fn execute_tool(
     };
 
     match result {
-        Ok(content) => ToolResult {
-            tool_use_id: tool_use_id.to_string(),
-            content,
-            is_error: false,
+        Ok(content) => ToolResult::ok(tool_use_id, content),
+        Err(err) => match classify_tool_error(&err) {
+            Some(code) => ToolResult::error_coded(tool_use_id, code, err),
+            None => ToolResult::error(tool_use_id, format!("Error: {err}")),
         },
-        Err(err) => ToolResult {
-            tool_use_id: tool_use_id.to_string(),
-            content: format!("Error: {err}"),
-            is_error: true,
-        },
+    }
+}
+
+/// Map an untyped tool-error string to a machine-readable [`ErrorCode`].
+///
+/// The dispatch returns `Result<String, String>`, so failure classes arrive as
+/// free text. This recovers a typed signal deterministically from the message so
+/// the model can re-plan correctly (retry a `TIMEOUT`, fix args on `INVALID_PARAM`,
+/// rephrase on `EMPTY_RESULT`) instead of pattern-matching prose. Returns `None`
+/// when the class is unknown — the error stays untyped rather than mislabeled.
+fn classify_tool_error(err: &str) -> Option<ErrorCode> {
+    let e = err.to_ascii_lowercase();
+    if e.contains("timed out") || e.contains("timeout") {
+        Some(ErrorCode::Timeout)
+    } else if e.contains("rate limit") || e.contains("429") || e.contains("too many requests") {
+        Some(ErrorCode::RateLimited)
+    } else if e.contains("not found")
+        || e.contains("no such file")
+        || e.contains("does not exist")
+        || e.contains("404")
+    {
+        Some(ErrorCode::NotFound)
+    } else if e.contains("invalid")
+        || e.contains("missing required")
+        || e.contains("must be")
+        || e.contains("expected")
+        || e.contains("malformed")
+        || e.contains("parse")
+    {
+        Some(ErrorCode::InvalidParam)
+    } else if e.contains("empty") || e.contains("no results") || e.contains("returned nothing") {
+        Some(ErrorCode::EmptyResult)
+    } else if e.contains("not available")
+        || e.contains("unavailable")
+        || e.contains("connection refused")
+        || e.contains("503")
+    {
+        Some(ErrorCode::DepDown)
+    } else {
+        None
     }
 }
 
@@ -3724,6 +3768,128 @@ async fn tool_canvas_present(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn test_privileged_tag_triggers_approval_without_name_list() {
+        // `agent_spawn` is tagged Privileged but is NOT in the default
+        // require_approval name list (which is just ["shell_exec"]) and is not a
+        // shell tool, so it has no exec-policy bypass. The gate must still fire
+        // purely from the side-effect tag, and a denial must block execution.
+        let kernel = Arc::new(FakeKernelHandle::denying());
+        let kh: Arc<dyn KernelHandle> = kernel.clone();
+        let result = execute_tool(
+            "tu-1",
+            "agent_spawn",
+            &serde_json::json!({"manifest": "name = \"x\""}),
+            Some(&kh),
+            None, // allowed_tools (no capability restriction)
+            Some("agent-a"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None, // exec_policy (none → no bypass)
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(
+            kernel.approval_calls.lock().unwrap().iter().any(|t| t == "agent_spawn"),
+            "approval gate should have fired for the privileged tool via its tag"
+        );
+        assert!(result.is_error, "denied tool must return an error result");
+        assert_eq!(
+            result.error_code,
+            Some(openfang_types::tool::ErrorCode::Denied)
+        );
+    }
+
+    #[test]
+    fn test_every_builtin_tool_is_classified() {
+        // Every built-in must have an explicit (non-default-by-fallthrough) tag,
+        // so the gate and scheduler never silently treat a known tool as unknown.
+        // We detect fallthrough by checking the tool resolves to a deliberate
+        // classification: a read default is only acceptable for genuine reads.
+        use openfang_types::tool::{tool_metadata, SideEffect};
+        let known_reads = [
+            "file_read",
+            "file_list",
+            "code_search",
+            "system_time",
+            "location_get",
+            "memory_recall",
+            "agent_list",
+            "agent_status",
+            "agent_find",
+            "task_list",
+            "schedule_list",
+            "cron_list",
+            "knowledge_query",
+            "process_poll",
+            "process_list",
+            "hand_list",
+            "hand_status",
+            "browser_read_page",
+            "browser_screenshot",
+        ];
+        for tool in builtin_tool_definitions() {
+            let meta = tool_metadata(&tool.name);
+            if meta.side_effects == SideEffect::None {
+                assert!(
+                    known_reads.contains(&tool.name.as_str()),
+                    "built-in '{}' fell through to the read default — add it to tool_metadata()",
+                    tool.name
+                );
+            }
+            // Mutating/privileged built-ins must carry an idempotency path.
+            if meta.side_effects.is_mutating() {
+                assert!(
+                    openfang_types::tool::make_idempotency_key(
+                        &tool.name,
+                        &serde_json::json!({})
+                    )
+                    .is_some(),
+                    "mutating built-in '{}' lacks an idempotency key",
+                    tool.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_classify_tool_error_maps_classes() {
+        assert_eq!(
+            classify_tool_error("Command timed out after 30s"),
+            Some(ErrorCode::Timeout)
+        );
+        assert_eq!(
+            classify_tool_error("HTTP 429: rate limit exceeded"),
+            Some(ErrorCode::RateLimited)
+        );
+        assert_eq!(
+            classify_tool_error("No such file or directory"),
+            Some(ErrorCode::NotFound)
+        );
+        assert_eq!(
+            classify_tool_error("missing required field 'query'"),
+            Some(ErrorCode::InvalidParam)
+        );
+        assert_eq!(
+            classify_tool_error("search returned nothing"),
+            Some(ErrorCode::EmptyResult)
+        );
+        assert_eq!(
+            classify_tool_error("Browser tools not available."),
+            Some(ErrorCode::DepDown)
+        );
+        // Unknown class stays untyped rather than mislabeled.
+        assert_eq!(classify_tool_error("something weird happened"), None);
+    }
+
     #[test]
     fn test_builtin_tool_definitions() {
         let tools = builtin_tool_definitions();
@@ -4612,6 +4778,10 @@ mod tests {
         created: std::sync::Mutex<Vec<(String, serde_json::Value)>>,
         cancelled: std::sync::Mutex<Vec<String>>,
         jobs: std::sync::Mutex<Vec<serde_json::Value>>,
+        /// Tool names for which `request_approval` was invoked (gate fired).
+        approval_calls: std::sync::Mutex<Vec<String>>,
+        /// When true, deny every approval request; otherwise auto-approve.
+        deny_approval: bool,
     }
 
     impl FakeKernelHandle {
@@ -4620,7 +4790,16 @@ mod tests {
                 created: std::sync::Mutex::new(Vec::new()),
                 cancelled: std::sync::Mutex::new(Vec::new()),
                 jobs: std::sync::Mutex::new(Vec::new()),
+                approval_calls: std::sync::Mutex::new(Vec::new()),
+                deny_approval: false,
             }
+        }
+
+        /// A kernel that records and denies every approval request.
+        fn denying() -> Self {
+            let mut h = Self::new();
+            h.deny_approval = true;
+            h
         }
 
         fn with_job(self, job: serde_json::Value) -> Self {
@@ -4710,6 +4889,15 @@ mod tests {
         }
         async fn task_list(&self, _status: Option<&str>) -> Result<Vec<serde_json::Value>, String> {
             Ok(vec![])
+        }
+        async fn request_approval(
+            &self,
+            _agent_id: &str,
+            tool_name: &str,
+            _action_summary: &str,
+        ) -> Result<bool, String> {
+            self.approval_calls.lock().unwrap().push(tool_name.to_string());
+            Ok(!self.deny_approval)
         }
         async fn publish_event(
             &self,

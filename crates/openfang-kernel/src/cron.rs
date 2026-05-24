@@ -176,6 +176,7 @@ impl CronScheduler {
     /// - `next_run` is at or before `last_run` (the rapid-refire bug shape:
     ///   `compute_next_run_after` previously fell through to `+1h` after a
     ///   parse failure, producing `next_run` close to `last_run`).
+    ///
     /// Healthy `next_run` values (in the future, or in the past but after the
     /// last fire — meaning the daemon was off across a fire window) are
     /// preserved so missed fires execute on boot.

@@ -108,17 +108,19 @@ impl SemanticStore {
             .map_err(|e| OpenFangError::Serialization(e.to_string()))?;
         let meta_str = serde_json::to_string(&metadata)
             .map_err(|e| OpenFangError::Serialization(e.to_string()))?;
+        let confidence = confidence_from_metadata(&metadata);
         let embedding_bytes: Option<Vec<u8>> = embedding.map(embedding_to_bytes);
 
         conn.execute(
             "INSERT INTO memories (id, agent_id, content, source, scope, confidence, metadata, created_at, accessed_at, access_count, deleted, embedding)
-             VALUES (?1, ?2, ?3, ?4, ?5, 1.0, ?6, ?7, ?7, 0, 0, ?8)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, 0, 0, ?9)",
             rusqlite::params![
                 id.0.to_string(),
                 agent_id.0.to_string(),
                 content,
                 source_str,
                 scope,
+                confidence,
                 meta_str,
                 now,
                 embedding_bytes,
@@ -468,6 +470,30 @@ impl SemanticStore {
 }
 
 /// Compute cosine similarity between two vectors.
+/// Derive a stored confidence (0.0–1.0) from write-time metadata.
+///
+/// Replaces the old hardcoded `1.0` so memories carry a real salience signal.
+/// `confirmed_by_user` always pins to 1.0 (the always-persist class). Otherwise
+/// an `importance` key (0–10, the same key the HTTP backend reads) maps linearly
+/// to 0.1–1.0. With no signal, defaults to a mid value so low-salience auto-saves
+/// don't masquerade as maximally confident.
+fn confidence_from_metadata(metadata: &HashMap<String, serde_json::Value>) -> f64 {
+    if metadata
+        .get("confirmed_by_user")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return 1.0;
+    }
+    match metadata.get("importance").and_then(|v| v.as_u64()) {
+        Some(imp) => {
+            let imp = imp.min(10) as f64;
+            (0.1 + (imp / 10.0) * 0.9).clamp(0.1, 1.0)
+        }
+        None => 0.6,
+    }
+}
+
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     if a.len() != b.len() || a.is_empty() {
         return 0.0;
@@ -532,6 +558,58 @@ mod tests {
         let results = store.recall("Rust", 10, None).unwrap();
         assert_eq!(results.len(), 1);
         assert!(results[0].content.contains("Rust"));
+    }
+
+    #[test]
+    fn test_confidence_from_metadata() {
+        // No signal → mid default, not the old blanket 1.0.
+        assert_eq!(confidence_from_metadata(&HashMap::new()), 0.6);
+
+        // Low importance lands well below 1.0.
+        let mut low = HashMap::new();
+        low.insert("importance".to_string(), serde_json::Value::from(1u64));
+        assert!(confidence_from_metadata(&low) < 1.0);
+        assert!(confidence_from_metadata(&low) >= 0.1);
+
+        // High importance approaches 1.0 but doesn't exceed it.
+        let mut high = HashMap::new();
+        high.insert("importance".to_string(), serde_json::Value::from(10u64));
+        assert!(confidence_from_metadata(&high) <= 1.0);
+        assert!(confidence_from_metadata(&high) > confidence_from_metadata(&low));
+
+        // Explicit user confirmation pins to 1.0 regardless of importance.
+        let mut confirmed = HashMap::new();
+        confirmed.insert(
+            "confirmed_by_user".to_string(),
+            serde_json::Value::Bool(true),
+        );
+        assert_eq!(confidence_from_metadata(&confirmed), 1.0);
+    }
+
+    #[test]
+    fn test_low_salience_write_is_not_max_confidence() {
+        // A low-importance memory must persist with confidence < 1.0, proving the
+        // hardcoded 1.0 is gone and salience actually reaches storage.
+        let store = setup();
+        let agent_id = AgentId::new();
+        let mut meta = HashMap::new();
+        meta.insert("importance".to_string(), serde_json::Value::from(2u64));
+        store
+            .remember(
+                agent_id,
+                "A low-signal aside",
+                MemorySource::Conversation,
+                "episodic",
+                meta,
+            )
+            .unwrap();
+        let results = store.recall("low-signal", 10, None).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(
+            results[0].confidence < 1.0,
+            "expected salience-derived confidence < 1.0, got {}",
+            results[0].confidence
+        );
     }
 
     #[test]

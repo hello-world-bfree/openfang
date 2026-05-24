@@ -209,18 +209,11 @@ pub fn build_system_prompt(ctx: &PromptContext) -> String {
         }
     }
 
-    // Section 15 — Live agent context (`context.md`). Re-read per turn so
-    // external writers (e.g. cron jobs refreshing live data) show up on the
-    // very next message. See issue #843.
-    if let Some(ref live) = ctx.context_md {
-        let trimmed = live.trim();
-        if !trimmed.is_empty() {
-            sections.push(format!(
-                "## Live Context\nThe following context is refreshed from `context.md` each turn and may change between messages.\n\n{}",
-                cap_str(trimmed, 8000)
-            ));
-        }
-    }
+    // NOTE: Live agent context (`context.md`, issue #843) is intentionally NOT
+    // added here. It is re-read per turn and changes between messages, so placing
+    // it in the cached system prefix invalidates the whole prefix every turn —
+    // the same cache-thrash bug already fixed for canonical context. It is now
+    // carried in a user message via `build_live_context_message`.
 
     sections.join("\n\n")
 }
@@ -302,6 +295,26 @@ pub fn build_canonical_context_message(ctx: &PromptContext) -> Option<String> {
         .as_ref()
         .filter(|c| !c.is_empty())
         .map(|c| format!("[Previous conversation context]\n{}", cap_str(c, 500)))
+}
+
+/// Build live `context.md` content as a standalone user message.
+///
+/// Live context is re-read from `context.md` every turn (so cron/external writers
+/// show up immediately) and therefore must NOT sit in the cached system prefix —
+/// doing so busts the entire prompt cache each turn. Carrying it in a user
+/// message keeps the system prompt byte-stable across turns. The text is data,
+/// not an instruction, so a user turn is the correct home for it.
+pub fn build_live_context_message(ctx: &PromptContext) -> Option<String> {
+    ctx.context_md
+        .as_ref()
+        .map(|c| c.trim())
+        .filter(|c| !c.is_empty())
+        .map(|c| {
+            format!(
+                "## Live Context\nThe following context is refreshed from `context.md` each turn and may change between messages.\n\n{}",
+                cap_str(c, 8000)
+            )
+        })
 }
 
 /// Build the memory section (Section 4).
@@ -948,25 +961,46 @@ mod tests {
     }
 
     #[test]
-    fn test_context_md_section_included() {
+    fn test_live_context_now_in_user_message_not_system_prompt() {
+        // Live context must live in the user message, NOT the system prompt, so
+        // the cached prefix stays stable across turns.
         let mut ctx = basic_ctx();
         ctx.context_md = Some("BTCUSD: 67000\nETHUSD: 3400".to_string());
         let prompt = build_system_prompt(&ctx);
-        assert!(prompt.contains("## Live Context"));
-        assert!(prompt.contains("BTCUSD: 67000"));
-        assert!(prompt.contains("ETHUSD: 3400"));
+        assert!(
+            !prompt.contains("## Live Context"),
+            "live context must not be in the system prompt"
+        );
+        let msg = build_live_context_message(&ctx).expect("live context message present");
+        assert!(msg.contains("## Live Context"));
+        assert!(msg.contains("BTCUSD: 67000"));
+        assert!(msg.contains("ETHUSD: 3400"));
     }
 
     #[test]
-    fn test_context_md_section_omitted_when_empty_or_none() {
+    fn test_live_context_message_omitted_when_empty_or_none() {
         let mut ctx = basic_ctx();
         ctx.context_md = None;
-        let prompt = build_system_prompt(&ctx);
-        assert!(!prompt.contains("## Live Context"));
+        assert!(build_live_context_message(&ctx).is_none());
 
         ctx.context_md = Some("   \n\n   ".to_string());
-        let prompt = build_system_prompt(&ctx);
-        assert!(!prompt.contains("## Live Context"));
+        assert!(build_live_context_message(&ctx).is_none());
+    }
+
+    #[test]
+    fn test_system_prompt_byte_stable_across_context_md_change() {
+        // Success criterion (Fix 1): the only diff between two calls is
+        // `context_md`, and the system prompt must be byte-identical — proving a
+        // changing context.md no longer busts the cached prefix.
+        let mut a = basic_ctx();
+        a.context_md = Some("turn-1 data: 100".to_string());
+        let mut b = basic_ctx();
+        b.context_md = Some("turn-2 data: 999 totally different".to_string());
+        assert_eq!(
+            build_system_prompt(&a),
+            build_system_prompt(&b),
+            "system prompt must not change when only context.md changes"
+        );
     }
 
     #[test]

@@ -1,0 +1,17 @@
+{
+  "name": "file_read_then_answer",
+  "description": "Single read then a final answer. A pure read must never hit the approval gate.",
+  "prompt": "What does notes.txt say?",
+  "script": [
+    {
+      "tool_calls": [
+        { "name": "file_read", "input": { "path": "notes.txt" } }
+      ]
+    },
+    { "text": "The file says hello." }
+  ],
+  "expected_tools": [
+    { "name": "file_read", "input": { "path": "notes.txt" } }
+  ],
+  "expect_any_error": false
+}

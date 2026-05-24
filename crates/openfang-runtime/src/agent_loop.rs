@@ -109,6 +109,111 @@ fn append_tool_error_guidance(tool_result_blocks: &mut Vec<ContentBlock>) {
     }
 }
 
+/// Decide whether a conversation turn is worth persisting to long-term memory,
+/// and if so with what salience.
+///
+/// Implements the memory-architecture write decision tree: turns that are
+/// trivially recoverable from the session log (empty/heartbeat responses, bare
+/// acknowledgements, single-line Q&A with no substance) are EPHEMERAL — they
+/// shouldn't crowd the semantic store. Surviving turns get an `importance`
+/// (0–10) that the store maps to a real confidence, replacing the old blanket
+/// `confidence = 1.0`. Returns `None` to skip the write entirely.
+fn salience_metadata(
+    user_message: &str,
+    response: &str,
+) -> Option<HashMap<String, serde_json::Value>> {
+    let resp = response.trim();
+    // Empty or heartbeat turns carry no recall value.
+    if resp.is_empty() || resp == "NO_REPLY" || resp.starts_with("[The model returned") {
+        return None;
+    }
+    // Bare acknowledgements ("ok", "done", "sure") are recoverable from the log.
+    let low_words = resp.split_whitespace().count();
+    let is_ack = low_words <= 3
+        && matches!(
+            resp.trim_end_matches(['.', '!']).to_ascii_lowercase().as_str(),
+            "ok" | "okay" | "done" | "sure" | "got it" | "yes" | "no" | "thanks"
+        );
+    if is_ack {
+        return None;
+    }
+    // Heuristic salience floor: longer, substantive exchanges score higher.
+    // Question-bearing user turns and longer responses are more worth recalling.
+    let combined = user_message.len() + resp.len();
+    let importance: u64 = match combined {
+        0..=120 => 3,
+        121..=400 => 5,
+        401..=1200 => 7,
+        _ => 8,
+    };
+    let mut meta = HashMap::new();
+    meta.insert(
+        "importance".to_string(),
+        serde_json::Value::from(importance),
+    );
+    meta.insert(
+        "scope".to_string(),
+        serde_json::Value::String("episodic".to_string()),
+    );
+    Some(meta)
+}
+
+/// Persist a conversation turn to memory with salience gating.
+///
+/// Skips low-signal turns (see [`salience_metadata`]) and tags survivors with an
+/// `importance` the store converts to confidence. Centralizes the embed-or-not
+/// remember path shared by the streaming and non-streaming loops.
+async fn save_interaction_memory(
+    memory: &MemorySubstrate,
+    agent_id: openfang_types::agent::AgentId,
+    user_message: &str,
+    response: &str,
+    embedding_driver: Option<&(dyn EmbeddingDriver + Send + Sync)>,
+) {
+    let Some(metadata) = salience_metadata(user_message, response) else {
+        return;
+    };
+    let interaction_text = format!("User asked: {}\nI responded: {}", user_message, response);
+    if let Some(emb) = embedding_driver {
+        match emb.embed_one(&interaction_text).await {
+            Ok(vec) => {
+                let _ = memory
+                    .remember_with_embedding_async(
+                        agent_id,
+                        &interaction_text,
+                        MemorySource::Conversation,
+                        "episodic",
+                        metadata,
+                        Some(&vec),
+                    )
+                    .await;
+            }
+            Err(e) => {
+                warn!("Embedding for remember failed: {e}");
+                let _ = memory
+                    .remember(
+                        agent_id,
+                        &interaction_text,
+                        MemorySource::Conversation,
+                        "episodic",
+                        metadata,
+                    )
+                    .await;
+            }
+        }
+    } else {
+        let _ = memory
+            .remember(
+                agent_id,
+                &interaction_text,
+                MemorySource::Conversation,
+                "episodic",
+                metadata,
+            )
+            .await;
+    }
+}
+
 /// Strip a provider prefix from a model ID before sending to the API.
 ///
 /// Many models are stored as `provider/org/model` (e.g. `openrouter/google/gemini-2.5-flash`)
@@ -207,6 +312,169 @@ fn build_user_turn_message(user_message: &str, blocks: Option<Vec<ContentBlock>>
             }
         }
         _ => Message::user(user_message),
+    }
+}
+
+/// Insert live `context.md` (from `manifest.metadata["live_context_msg"]`) as a
+/// user message immediately before the current user turn.
+///
+/// Live context is re-read each turn, so the kernel deliberately keeps it out of
+/// the cached system prefix; this places it adjacent to the question it informs
+/// while leaving the system prompt byte-stable across turns (#843). Positioned
+/// before the last message (the current user turn) so it reads as the freshest
+/// context the model sees.
+fn inject_live_context(messages: &mut Vec<Message>, manifest: &AgentManifest) {
+    let Some(lc_msg) = manifest
+        .metadata
+        .get("live_context_msg")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    else {
+        return;
+    };
+    let pos = messages.len().saturating_sub(1);
+    messages.insert(pos, Message::user(lc_msg));
+}
+
+/// Maximum number of read-only tools to execute concurrently in a fan-out turn.
+///
+/// Capped per failure #10 (latency cliff): unbounded concurrency on a burst of
+/// reads can overwhelm downstream resources. 4 is a conservative default.
+const MAX_PARALLEL_READS: usize = 4;
+
+/// Execute a single already-guard-approved tool call with full instrumentation
+/// (phase callback, Before/After hooks, timeout, truncation, loop-guard Warn
+/// append) and return the result block.
+///
+/// This is factored out of the main loop so the read-only subset of a multi-tool
+/// turn can be fanned out concurrently (Fix 6) while reusing the exact same
+/// per-tool semantics as the sequential path. It takes only shared references and
+/// owns no `&mut` state, so it is safe to run several of these futures at once.
+#[allow(clippy::too_many_arguments)]
+async fn execute_tool_call_instrumented(
+    tool_call: &ToolCall,
+    verdict: &LoopGuardVerdict,
+    manifest: &AgentManifest,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+    allowed_tool_names: &[String],
+    caller_id_str: &str,
+    skill_registry: Option<&SkillRegistry>,
+    mcp_connections: Option<&tokio::sync::Mutex<Vec<McpConnection>>>,
+    web_ctx: Option<&WebToolsContext>,
+    browser_ctx: Option<&crate::browser::BrowserManager>,
+    hand_allowed_env: &[String],
+    workspace_root: Option<&Path>,
+    media_engine: Option<&crate::media_understanding::MediaEngine>,
+    tts_engine: Option<&crate::tts::TtsEngine>,
+    docker_config: Option<&openfang_types::config::DockerSandboxConfig>,
+    process_manager: Option<&crate::process_manager::ProcessManager>,
+    on_phase: Option<&PhaseCallback>,
+    hooks: Option<&crate::hooks::HookRegistry>,
+    context_budget: &crate::context_budget::ContextBudget,
+) -> ContentBlock {
+    // Notify phase: ToolUse
+    if let Some(cb) = on_phase {
+        let sanitized: String = tool_call
+            .name
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(64)
+            .collect();
+        cb(LoopPhase::ToolUse {
+            tool_name: sanitized,
+        });
+    }
+
+    // Fire BeforeToolCall hook (can block execution)
+    if let Some(hook_reg) = hooks {
+        let ctx = crate::hooks::HookContext {
+            agent_name: &manifest.name,
+            agent_id: caller_id_str,
+            event: openfang_types::agent::HookEvent::BeforeToolCall,
+            data: serde_json::json!({
+                "tool_name": &tool_call.name,
+                "input": &tool_call.input,
+            }),
+        };
+        if let Err(reason) = hook_reg.fire(&ctx) {
+            return ContentBlock::ToolResult {
+                tool_use_id: tool_call.id.clone(),
+                tool_name: tool_call.name.clone(),
+                content: format!("Hook blocked tool '{}': {}", tool_call.name, reason),
+                is_error: true,
+            };
+        }
+    }
+
+    let effective_exec_policy = manifest.exec_policy.as_ref();
+    let timeout = tool_timeout_for(&tool_call.name);
+    let timeout_secs = timeout.as_secs();
+    let result = match tokio::time::timeout(
+        timeout,
+        tool_runner::execute_tool(
+            &tool_call.id,
+            &tool_call.name,
+            &tool_call.input,
+            kernel,
+            Some(allowed_tool_names),
+            Some(caller_id_str),
+            skill_registry,
+            mcp_connections,
+            web_ctx,
+            browser_ctx,
+            if hand_allowed_env.is_empty() {
+                None
+            } else {
+                Some(hand_allowed_env)
+            },
+            workspace_root,
+            media_engine,
+            effective_exec_policy,
+            tts_engine,
+            docker_config,
+            process_manager,
+        ),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            warn!(tool = %tool_call.name, "Tool execution timed out after {}s", timeout_secs);
+            openfang_types::tool::ToolResult::error_coded(
+                tool_call.id.clone(),
+                openfang_types::tool::ErrorCode::Timeout,
+                format!("Tool '{}' timed out after {}s.", tool_call.name, timeout_secs),
+            )
+        }
+    };
+
+    // Fire AfterToolCall hook
+    if let Some(hook_reg) = hooks {
+        let ctx = crate::hooks::HookContext {
+            agent_name: &manifest.name,
+            agent_id: caller_id_str,
+            event: openfang_types::agent::HookEvent::AfterToolCall,
+            data: serde_json::json!({
+                "tool_name": &tool_call.name,
+                "result": &result.content,
+                "is_error": result.is_error,
+            }),
+        };
+        let _ = hook_reg.fire(&ctx);
+    }
+
+    let content = truncate_tool_result_dynamic(&result.content, context_budget);
+    let final_content = if let LoopGuardVerdict::Warn(ref warn_msg) = verdict {
+        format!("{content}\n\n[LOOP GUARD] {warn_msg}")
+    } else {
+        content
+    };
+
+    ContentBlock::ToolResult {
+        tool_use_id: result.tool_use_id,
+        tool_name: tool_call.name.clone(),
+        content: final_content,
+        is_error: result.is_error,
     }
 }
 
@@ -372,6 +640,11 @@ pub async fn run_agent_loop(
             messages.insert(0, Message::user(cc_msg));
         }
     }
+
+    // Inject live context.md as a user message just before the current user turn.
+    // Like canonical context, it stays out of the cached system prefix so a
+    // per-turn change to context.md no longer busts the prompt cache (#843).
+    inject_live_context(&mut messages, manifest);
 
     let mut total_usage = TokenUsage::default();
     let final_response;
@@ -650,49 +923,15 @@ pub async fn run_agent_loop(
                     .await
                     .map_err(|e| OpenFangError::Memory(e.to_string()))?;
 
-                // Remember this interaction (with embedding if available)
-                let interaction_text = format!(
-                    "User asked: {}\nI responded: {}",
-                    user_message, final_response
-                );
-                if let Some(emb) = embedding_driver {
-                    match emb.embed_one(&interaction_text).await {
-                        Ok(vec) => {
-                            let _ = memory
-                                .remember_with_embedding_async(
-                                    session.agent_id,
-                                    &interaction_text,
-                                    MemorySource::Conversation,
-                                    "episodic",
-                                    HashMap::new(),
-                                    Some(&vec),
-                                )
-                                .await;
-                        }
-                        Err(e) => {
-                            warn!("Embedding for remember failed: {e}");
-                            let _ = memory
-                                .remember(
-                                    session.agent_id,
-                                    &interaction_text,
-                                    MemorySource::Conversation,
-                                    "episodic",
-                                    HashMap::new(),
-                                )
-                                .await;
-                        }
-                    }
-                } else {
-                    let _ = memory
-                        .remember(
-                            session.agent_id,
-                            &interaction_text,
-                            MemorySource::Conversation,
-                            "episodic",
-                            HashMap::new(),
-                        )
-                        .await;
-                }
+                // Remember this interaction (salience-gated, with embedding if available)
+                save_interaction_memory(
+                    memory,
+                    session.agent_id,
+                    user_message,
+                    &final_response,
+                    embedding_driver,
+                )
+                .await;
 
                 // Notify phase: Done
                 if let Some(cb) = on_phase {
@@ -764,19 +1003,23 @@ pub async fn run_agent_loop(
                     available_tools.iter().map(|t| t.name.clone()).collect();
                 let caller_id_str = session.agent_id.to_string();
 
-                // Execute each tool call with loop guard, timeout, and truncation
-                let mut tool_result_blocks = Vec::new();
-                for tool_call in deduplicate_tool_calls(&response) {
-                    // Loop guard check
+                // Execute each tool call with loop guard, timeout, and truncation.
+                //
+                // Step 1 (always serial, always in order): run every loop_guard
+                // check. The guard is `&mut self` and order-sensitive (circuit
+                // breaker, ping-pong history, per-hash counts), so this MUST stay
+                // serialized even when execution fans out — out-of-order checks
+                // make the guard's counters nondeterministic.
+                let mut planned: Vec<(usize, ToolCall, LoopGuardVerdict)> = Vec::new();
+                let mut blocked_results: Vec<(usize, ContentBlock)> = Vec::new();
+                for (idx, tool_call) in deduplicate_tool_calls(&response).into_iter().enumerate() {
                     let verdict = loop_guard.check(&tool_call.name, &tool_call.input);
                     match &verdict {
                         LoopGuardVerdict::CircuitBreak(msg) => {
                             warn!(tool = %tool_call.name, "Circuit breaker triggered");
-                            // Save session before bailing
                             if let Err(e) = memory.save_session_async(session).await {
                                 warn!("Failed to save session on circuit break: {e}");
                             }
-                            // Fire AgentLoopEnd hook on circuit break
                             if let Some(hook_reg) = hooks {
                                 let ctx = crate::hooks::HookContext {
                                     agent_name: &manifest.name,
@@ -793,137 +1036,110 @@ pub async fn run_agent_loop(
                         }
                         LoopGuardVerdict::Block(msg) => {
                             warn!(tool = %tool_call.name, "Tool call blocked by loop guard");
-                            tool_result_blocks.push(ContentBlock::ToolResult {
-                                tool_use_id: tool_call.id.clone(),
-                                tool_name: tool_call.name.clone(),
-                                content: msg.clone(),
-                                is_error: true,
-                            });
-                            continue;
+                            blocked_results.push((
+                                idx,
+                                ContentBlock::ToolResult {
+                                    tool_use_id: tool_call.id.clone(),
+                                    tool_name: tool_call.name.clone(),
+                                    content: msg.clone(),
+                                    is_error: true,
+                                },
+                            ));
                         }
-                        _ => {} // Allow or Warn — proceed with execution
+                        _ => planned.push((idx, tool_call.clone(), verdict)),
                     }
+                }
 
-                    debug!(tool = %tool_call.name, id = %tool_call.id, "Executing tool");
+                // Step 2: execute the approved calls. If there is more than one
+                // and every one is a pure read (side_effects == None), fan them
+                // out concurrently under a semaphore (Fix 6). Any mutating /
+                // privileged / external tool in the batch → fully sequential, to
+                // preserve ordering, approval, and session-mutation semantics.
+                let all_reads = planned.len() > 1
+                    && planned.iter().all(|(_, tc, _)| {
+                        openfang_types::tool::tool_metadata(&tc.name)
+                            .side_effects
+                            .is_read_only()
+                    });
 
-                    // Notify phase: ToolUse
-                    if let Some(cb) = on_phase {
-                        let sanitized: String = tool_call
-                            .name
-                            .chars()
-                            .filter(|c| !c.is_control())
-                            .take(64)
-                            .collect();
-                        cb(LoopPhase::ToolUse {
-                            tool_name: sanitized,
-                        });
-                    }
-
-                    // Fire BeforeToolCall hook (can block execution)
-                    if let Some(hook_reg) = hooks {
-                        let ctx = crate::hooks::HookContext {
-                            agent_name: &manifest.name,
-                            agent_id: &caller_id_str,
-                            event: openfang_types::agent::HookEvent::BeforeToolCall,
-                            data: serde_json::json!({
-                                "tool_name": &tool_call.name,
-                                "input": &tool_call.input,
-                            }),
-                        };
-                        if let Err(reason) = hook_reg.fire(&ctx) {
-                            tool_result_blocks.push(ContentBlock::ToolResult {
-                                tool_use_id: tool_call.id.clone(),
-                                tool_name: tool_call.name.clone(),
-                                content: format!(
-                                    "Hook blocked tool '{}': {}",
-                                    tool_call.name, reason
-                                ),
-                                is_error: true,
-                            });
-                            continue;
+                let mut executed: Vec<(usize, ContentBlock)> = Vec::with_capacity(planned.len());
+                if all_reads {
+                    debug!(count = planned.len(), "Fanning out read-only tools in parallel");
+                    // Bind shared context as references once so the per-task
+                    // `async move` blocks capture Copy references, not the
+                    // captured outer variables themselves.
+                    let kernel_ref = kernel.as_ref();
+                    let allowed_ref = &allowed_tool_names;
+                    let caller_ref = caller_id_str.as_str();
+                    let hand_env_ref = &hand_allowed_env;
+                    let budget_ref = &context_budget;
+                    let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_PARALLEL_READS));
+                    let futures = planned.iter().map(|(idx, tool_call, verdict)| {
+                        let semaphore = semaphore.clone();
+                        async move {
+                            let _permit = semaphore.acquire().await.expect("semaphore open");
+                            let block = execute_tool_call_instrumented(
+                                tool_call,
+                                verdict,
+                                manifest,
+                                kernel_ref,
+                                allowed_ref,
+                                caller_ref,
+                                skill_registry,
+                                mcp_connections,
+                                web_ctx,
+                                browser_ctx,
+                                hand_env_ref,
+                                workspace_root,
+                                media_engine,
+                                tts_engine,
+                                docker_config,
+                                process_manager,
+                                on_phase,
+                                hooks,
+                                budget_ref,
+                            )
+                            .await;
+                            (*idx, block)
                         }
-                    }
-
-                    // Resolve effective exec policy (per-agent override or global)
-                    let effective_exec_policy = manifest.exec_policy.as_ref();
-
-                    // Timeout-wrapped execution
-                    let timeout = tool_timeout_for(&tool_call.name);
-                    let timeout_secs = timeout.as_secs();
-                    let result = match tokio::time::timeout(
-                        timeout,
-                        tool_runner::execute_tool(
-                            &tool_call.id,
-                            &tool_call.name,
-                            &tool_call.input,
+                    });
+                    executed = futures::future::join_all(futures).await;
+                } else {
+                    for (idx, tool_call, verdict) in &planned {
+                        debug!(tool = %tool_call.name, id = %tool_call.id, "Executing tool");
+                        let block = execute_tool_call_instrumented(
+                            tool_call,
+                            verdict,
+                            manifest,
                             kernel.as_ref(),
-                            Some(&allowed_tool_names),
-                            Some(&caller_id_str),
+                            &allowed_tool_names,
+                            &caller_id_str,
                             skill_registry,
                             mcp_connections,
                             web_ctx,
                             browser_ctx,
-                            if hand_allowed_env.is_empty() {
-                                None
-                            } else {
-                                Some(&hand_allowed_env)
-                            },
+                            &hand_allowed_env,
                             workspace_root,
                             media_engine,
-                            effective_exec_policy,
                             tts_engine,
                             docker_config,
                             process_manager,
-                        ),
-                    )
-                    .await
-                    {
-                        Ok(result) => result,
-                        Err(_) => {
-                            warn!(tool = %tool_call.name, "Tool execution timed out after {}s", timeout_secs);
-                            openfang_types::tool::ToolResult {
-                                tool_use_id: tool_call.id.clone(),
-                                content: format!(
-                                    "Tool '{}' timed out after {}s.",
-                                    tool_call.name, timeout_secs
-                                ),
-                                is_error: true,
-                            }
-                        }
-                    };
-
-                    // Fire AfterToolCall hook
-                    if let Some(hook_reg) = hooks {
-                        let ctx = crate::hooks::HookContext {
-                            agent_name: &manifest.name,
-                            agent_id: caller_id_str.as_str(),
-                            event: openfang_types::agent::HookEvent::AfterToolCall,
-                            data: serde_json::json!({
-                                "tool_name": &tool_call.name,
-                                "result": &result.content,
-                                "is_error": result.is_error,
-                            }),
-                        };
-                        let _ = hook_reg.fire(&ctx);
+                            on_phase,
+                            hooks,
+                            &context_budget,
+                        )
+                        .await;
+                        executed.push((*idx, block));
                     }
-
-                    // Dynamic truncation based on context budget (replaces flat MAX_TOOL_RESULT_CHARS)
-                    let content = truncate_tool_result_dynamic(&result.content, &context_budget);
-
-                    // Append warning if verdict was Warn
-                    let final_content = if let LoopGuardVerdict::Warn(ref warn_msg) = verdict {
-                        format!("{content}\n\n[LOOP GUARD] {warn_msg}")
-                    } else {
-                        content
-                    };
-
-                    tool_result_blocks.push(ContentBlock::ToolResult {
-                        tool_use_id: result.tool_use_id,
-                        tool_name: tool_call.name.clone(),
-                        content: final_content,
-                        is_error: result.is_error,
-                    });
                 }
+
+                // Merge blocked + executed results back into original call order
+                // (deterministic by index, not completion order — failure #25).
+                let mut indexed = blocked_results;
+                indexed.extend(executed);
+                indexed.sort_by_key(|(idx, _)| *idx);
+                let mut tool_result_blocks: Vec<ContentBlock> =
+                    indexed.into_iter().map(|(_, block)| block).collect();
 
                 append_tool_error_guidance(&mut tool_result_blocks);
 
@@ -1603,6 +1819,10 @@ pub async fn run_agent_loop_streaming(
         }
     }
 
+    // Inject live context.md as a user message just before the current user turn
+    // (kept out of the cached system prefix — see non-stream path and #843).
+    inject_live_context(&mut messages, manifest);
+
     let mut total_usage = TokenUsage::default();
     let final_response;
     let mut accumulated_text = String::new();
@@ -1869,49 +2089,15 @@ pub async fn run_agent_loop_streaming(
                     .await
                     .map_err(|e| OpenFangError::Memory(e.to_string()))?;
 
-                // Remember this interaction (with embedding if available)
-                let interaction_text = format!(
-                    "User asked: {}\nI responded: {}",
-                    user_message, final_response
-                );
-                if let Some(emb) = embedding_driver {
-                    match emb.embed_one(&interaction_text).await {
-                        Ok(vec) => {
-                            let _ = memory
-                                .remember_with_embedding_async(
-                                    session.agent_id,
-                                    &interaction_text,
-                                    MemorySource::Conversation,
-                                    "episodic",
-                                    HashMap::new(),
-                                    Some(&vec),
-                                )
-                                .await;
-                        }
-                        Err(e) => {
-                            warn!("Embedding for remember failed (streaming): {e}");
-                            let _ = memory
-                                .remember(
-                                    session.agent_id,
-                                    &interaction_text,
-                                    MemorySource::Conversation,
-                                    "episodic",
-                                    HashMap::new(),
-                                )
-                                .await;
-                        }
-                    }
-                } else {
-                    let _ = memory
-                        .remember(
-                            session.agent_id,
-                            &interaction_text,
-                            MemorySource::Conversation,
-                            "episodic",
-                            HashMap::new(),
-                        )
-                        .await;
-                }
+                // Remember this interaction (salience-gated, with embedding if available)
+                save_interaction_memory(
+                    memory,
+                    session.agent_id,
+                    user_message,
+                    &final_response,
+                    embedding_driver,
+                )
+                .await;
 
                 // Notify phase: Done
                 if let Some(cb) = on_phase {
@@ -2093,14 +2279,14 @@ pub async fn run_agent_loop_streaming(
                         Ok(result) => result,
                         Err(_) => {
                             warn!(tool = %tool_call.name, "Tool execution timed out after {}s (streaming)", timeout_secs);
-                            openfang_types::tool::ToolResult {
-                                tool_use_id: tool_call.id.clone(),
-                                content: format!(
+                            openfang_types::tool::ToolResult::error_coded(
+                                tool_call.id.clone(),
+                                openfang_types::tool::ErrorCode::Timeout,
+                                format!(
                                     "Tool '{}' timed out after {}s.",
                                     tool_call.name, timeout_secs
                                 ),
-                                is_error: true,
-                            }
+                            )
                         }
                     };
 
@@ -3151,6 +3337,88 @@ mod tests {
     #[test]
     fn test_max_iterations_constant() {
         assert_eq!(MAX_ITERATIONS, 50);
+    }
+
+    #[test]
+    fn test_fanout_eligibility_reads_only() {
+        use openfang_types::tool::tool_metadata;
+        // The fan-out predicate: >1 call AND every call is a pure read.
+        let eligible = |names: &[&str]| {
+            names.len() > 1
+                && names
+                    .iter()
+                    .all(|n| tool_metadata(n).side_effects.is_read_only())
+        };
+        // Multiple reads → eligible for parallel fan-out.
+        assert!(eligible(&["file_read", "file_list", "system_time"]));
+        // A single read → not fanned out (no benefit).
+        assert!(!eligible(&["file_read"]));
+        // Any mutating tool in the batch → sequential fallback.
+        assert!(!eligible(&["file_read", "file_write"]));
+        // Any privileged tool in the batch → sequential fallback.
+        assert!(!eligible(&["file_read", "shell_exec"]));
+        // External call (web) is not a pure read → sequential.
+        assert!(!eligible(&["file_read", "web_fetch"]));
+    }
+
+    #[test]
+    fn test_max_parallel_reads_cap() {
+        assert_eq!(MAX_PARALLEL_READS, 4);
+    }
+
+    #[test]
+    fn test_salience_gate_skips_low_signal_turns() {
+        // Empty, heartbeat, and bare-ack responses are recoverable from the log
+        // and must not be persisted — this is what keeps a 10-turn session from
+        // writing 10 memories.
+        assert!(salience_metadata("hi", "").is_none());
+        assert!(salience_metadata("status?", "NO_REPLY").is_none());
+        assert!(salience_metadata("do it", "ok").is_none());
+        assert!(salience_metadata("thanks", "Sure.").is_none());
+
+        // A substantive exchange survives and carries an importance signal.
+        let meta = salience_metadata(
+            "Explain how prompt caching reduces cost across turns.",
+            "Prompt caching stores the stable prefix so repeat turns only pay for \
+             the cache-read multiplier instead of re-billing the full prefix.",
+        )
+        .expect("substantive turn should be persisted");
+        let importance = meta
+            .get("importance")
+            .and_then(|v| v.as_u64())
+            .expect("importance tag present");
+        assert!((1..=10).contains(&importance));
+    }
+
+    #[test]
+    fn test_salience_gate_write_count_below_turn_count() {
+        // Simulate a 10-turn session dominated by low-signal turns; assert the
+        // number of would-be writes is strictly less than the turn count.
+        let turns = [
+            ("q1", "ok"),
+            ("q2", ""),
+            ("q3", "done"),
+            ("q4", "NO_REPLY"),
+            ("q5", "yes"),
+            (
+                "Walk me through the salience write-gate design.",
+                "The gate drops log-recoverable turns and assigns importance to the rest \
+                 so the semantic store isn't a dumping ground.",
+            ),
+            ("q7", "sure"),
+            ("q8", "thanks"),
+            ("q9", "got it"),
+            ("q10", "no"),
+        ];
+        let writes = turns
+            .iter()
+            .filter(|(u, r)| salience_metadata(u, r).is_some())
+            .count();
+        assert!(
+            writes < turns.len(),
+            "salience gate should write fewer memories than turns; wrote {writes}/{}",
+            turns.len()
+        );
     }
 
     #[test]

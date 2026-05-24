@@ -1,0 +1,17 @@
+{
+  "name": "missing_file_error",
+  "description": "Reads a nonexistent file. Per anti-pattern #3 the harness must exercise a real tool error, not only happy paths. The tool selection is still correct even though the call fails.",
+  "prompt": "Read ghost.txt",
+  "script": [
+    {
+      "tool_calls": [
+        { "name": "file_read", "input": { "path": "ghost.txt" } }
+      ]
+    },
+    { "text": "That file does not exist." }
+  ],
+  "expected_tools": [
+    { "name": "file_read", "input": { "path": "ghost.txt" } }
+  ],
+  "expect_any_error": true
+}

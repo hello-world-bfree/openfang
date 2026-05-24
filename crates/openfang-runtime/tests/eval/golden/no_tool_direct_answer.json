@@ -1,0 +1,10 @@
+{
+  "name": "no_tool_direct_answer",
+  "description": "A turn that needs no tools. The model answers directly; the expected tool sequence is empty.",
+  "prompt": "Say hello.",
+  "script": [
+    { "text": "Hello!" }
+  ],
+  "expected_tools": [],
+  "expect_any_error": false
+}

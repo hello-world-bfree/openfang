@@ -1,0 +1,17 @@
+{
+  "name": "system_time_only",
+  "description": "A no-argument read tool. Verifies argument-less calls hash and match.",
+  "prompt": "What time is it?",
+  "script": [
+    {
+      "tool_calls": [
+        { "name": "system_time", "input": {} }
+      ]
+    },
+    { "text": "It is the current time." }
+  ],
+  "expected_tools": [
+    { "name": "system_time", "input": {} }
+  ],
+  "expect_any_error": false
+}
