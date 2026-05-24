@@ -55,6 +55,11 @@ pub fn bundled_hands() -> Vec<(&'static str, &'static str, &'static str)> {
             include_str!("../bundled/repo-digger/HAND.toml"),
             include_str!("../bundled/repo-digger/SKILL.md"),
         ),
+        (
+            "book-distiller",
+            include_str!("../bundled/book-distiller/HAND.toml"),
+            include_str!("../bundled/book-distiller/SKILL.md"),
+        ),
     ]
 }
 
@@ -86,7 +91,7 @@ mod tests {
     #[test]
     fn bundled_hands_count() {
         let hands = bundled_hands();
-        assert_eq!(hands.len(), 10);
+        assert_eq!(hands.len(), 11);
     }
 
     #[test]
@@ -140,6 +145,153 @@ mod tests {
             );
         }
         assert!(!skill.is_empty(), "SKILL.md must ship with content");
+    }
+
+    #[test]
+    fn book_distiller_registered() {
+        let hands = bundled_hands();
+        let ids: Vec<&str> = hands.iter().map(|(id, _, _)| *id).collect();
+        assert!(ids.contains(&"book-distiller"));
+    }
+
+    #[test]
+    fn parse_book_distiller_hand() {
+        let (id, toml_content, skill_content) = bundled_hands()
+            .into_iter()
+            .find(|(id, _, _)| *id == "book-distiller")
+            .expect("book-distiller hand must be in bundled_hands()");
+        let def = parse_bundled(id, toml_content, skill_content).unwrap();
+        assert_eq!(def.id, "book-distiller");
+        assert_eq!(def.name, "Book Distiller Hand");
+        assert_eq!(def.category, crate::HandCategory::Productivity);
+        assert!(def.skill_content.is_some());
+
+        // Required env vars per plan amendment H6.
+        let req_keys: Vec<&str> = def.requires.iter().map(|r| r.key.as_str()).collect();
+        for required in &[
+            "ANTHROPIC_API_KEY",
+            "R2_ACCESS_KEY_ID",
+            "R2_SECRET_ACCESS_KEY",
+            "R2_ENDPOINT_URL",
+            "epub_extract_script",
+            "r2_fetch_script",
+            "distill_chapter_script",
+            "r2_put_script",
+        ] {
+            assert!(
+                req_keys.contains(required),
+                "book-distiller must declare required '{required}'"
+            );
+        }
+
+        // Tools that MUST be granted (single-underscore canonical for MCP).
+        for required in &[
+            "shell_exec",
+            "file_read",
+            "file_write",
+            "file_list",
+            "memory_store",
+            "memory_recall",
+            "event_publish",
+            "mcp_dbx_execute_query",
+            "mcp_dbx_list_connections",
+        ] {
+            assert!(
+                def.tools.iter().any(|t| t == required),
+                "book-distiller tools missing required entry '{required}'"
+            );
+        }
+
+        // Settings — the user-facing primary inputs.
+        let setting_keys: Vec<&str> = def.settings.iter().map(|s| s.key.as_str()).collect();
+        for required in &[
+            "collection_id",
+            "collection_name",
+            "book_queue_dir",
+            "output_root",
+            "library_db_conn",
+            "r2_bucket",
+            "extract_script_path",
+            "r2_fetch_script_path",
+            "r2_put_script_path",
+            "r2_distilled_prefix",
+            "upload_to_r2",
+            "distill_script_path",
+            "model_prose",
+            "model_code",
+            "budget_cap_usd",
+            "force_reprocess",
+            "preview_only",
+        ] {
+            assert!(
+                setting_keys.contains(required),
+                "book-distiller settings missing '{required}'"
+            );
+        }
+
+        // Agent config — plan-mandated values (plan amendments H5, H7, H8).
+        assert_eq!(def.agent.provider, "anthropic");
+        assert!(
+            def.agent.cache_system_prompt,
+            "cache_system_prompt must be true per plan amendment H7"
+        );
+        assert_eq!(
+            def.agent.max_iterations,
+            Some(200),
+            "max_iterations must be 200 per plan amendment H5"
+        );
+        assert_eq!(
+            def.agent.heartbeat_interval_secs,
+            Some(120),
+            "heartbeat must be 120s for long LLM calls"
+        );
+        assert!((def.agent.temperature - 0.2).abs() < 0.05);
+
+        // Dashboard — plan-mandated metrics for operability.
+        let metric_keys: Vec<&str> = def
+            .dashboard
+            .metrics
+            .iter()
+            .map(|m| m.memory_key.as_str())
+            .collect();
+        for required in &[
+            "book_distiller_current_collection",
+            "book_distiller_books_done",
+            "book_distiller_books_total",
+            "book_distiller_chapters_done",
+            "book_distiller_usd_active",
+            "book_distiller_eta",
+            "book_distiller_code_mutations_flagged",
+            "book_distiller_truncated_chapters",
+            "book_distiller_ratio_violations",
+        ] {
+            assert!(
+                metric_keys.contains(required),
+                "book-distiller dashboard missing metric key '{required}'"
+            );
+        }
+
+        // No `:` in any memory key (plan amendment C5).
+        for mk in &metric_keys {
+            assert!(
+                !mk.contains(':'),
+                "memory key '{mk}' must not contain ':' — use '_' (plan amendment C5)"
+            );
+        }
+
+        // Tools that MUST NOT be granted (footguns).
+        for forbidden in &["agent_spawn", "agent_send", "agent_kill", "vault_set"] {
+            assert!(
+                !def.tools.iter().any(|t| t == forbidden),
+                "book-distiller must NOT grant '{forbidden}'"
+            );
+        }
+
+        assert!(!skill_content.is_empty(), "SKILL.md must ship with content");
+        assert!(
+            skill_content.contains("epub-extract.py"),
+            "SKILL.md must document epub-extract.py install"
+        );
     }
 
     #[test]

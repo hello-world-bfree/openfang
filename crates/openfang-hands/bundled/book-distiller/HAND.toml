@@ -1,0 +1,748 @@
+id = "book-distiller"
+name = "Book Distiller Hand"
+description = "Walks technical epubs chapter-by-chapter and emits brutal cliff-notes — caveman-tight prose, code preserved verbatim, fluff dropped. Reads from a self-hosted Postgres library + Cloudflare R2 epub bucket, writes markdown grep-ready for both humans and coding agents."
+category = "productivity"
+icon = "📚"
+
+# Tools — single-underscore canonical form for MCP-namespaced tools (see
+# crates/openfang-runtime/src/mcp.rs:357 — `mcp_<server>_<tool>`). Capability
+# matching is exact-string at capability.rs:119; no wildcards.
+tools = [
+  "shell_exec",
+  "file_read", "file_write", "file_list",
+  "memory_store", "memory_recall",
+  "schedule_create", "schedule_list", "schedule_delete",
+  "knowledge_add_entity", "knowledge_add_relation", "knowledge_query",
+  "event_publish",
+  "mcp_dbx_execute_query",
+  "mcp_dbx_list_connections",
+]
+
+# ─── Requirements ─────────────────────────────────────────────────────────────
+# requirement_type accepts only `binary` | `env_var` | `api_key`
+# (RequirementType in lib.rs:73). The `library` dbx connection and the
+# epub-extract.py script are validated by the agent's Phase 0 pre-flight
+# probes inside the system prompt rather than the requirement system.
+
+[[requires]]
+key = "ANTHROPIC_API_KEY"
+label = "Anthropic API Key"
+requirement_type = "api_key"
+check_value = "ANTHROPIC_API_KEY"
+description = "Required because provider=anthropic. Project's GROQ_API_KEY does NOT host Claude models."
+
+[[requires]]
+key = "R2_ACCESS_KEY_ID"
+label = "Cloudflare R2 Access Key ID"
+requirement_type = "env_var"
+check_value = "R2_ACCESS_KEY_ID"
+description = "Cloudflare R2 access key id (S3-compatible). Find under R2 → Manage R2 API Tokens."
+
+[[requires]]
+key = "R2_SECRET_ACCESS_KEY"
+label = "Cloudflare R2 Secret Access Key"
+requirement_type = "env_var"
+check_value = "R2_SECRET_ACCESS_KEY"
+description = "Cloudflare R2 secret access key. Pair with R2_ACCESS_KEY_ID."
+
+[[requires]]
+key = "R2_ENDPOINT_URL"
+label = "Cloudflare R2 Endpoint URL"
+requirement_type = "env_var"
+check_value = "R2_ENDPOINT_URL"
+description = "Cloudflare R2 endpoint, e.g. https://<account-id>.r2.cloudflarestorage.com. Without this the AWS CLI defaults to AWS S3 and every fetch fails."
+
+[[requires]]
+key = "epub_extract_script"
+label = "epub-extract.py installed"
+requirement_type = "binary"
+check_value = "epub-extract.py"
+description = "User-install Python helper that turns an .epub into per-chapter Markdown. Ships its own venv (Python 3.12 + ebooklib + bs4 + lxml). Install heredoc: book-distiller/SKILL.md §1-3."
+
+[[requires]]
+key = "r2_fetch_script"
+label = "r2-fetch.py installed"
+requirement_type = "binary"
+check_value = "r2-fetch.py"
+description = "User-install Python helper that downloads one R2 object via boto3 (avoids brew awscli's libexpat/libxml conflict). Ships in same venv as epub-extract.py. Install heredoc: book-distiller/SKILL.md §1-3."
+
+[[requires]]
+key = "distill_chapter_script"
+label = "distill-chapter.py installed"
+requirement_type = "binary"
+check_value = "distill-chapter.py"
+description = "User-install Anthropic-SDK helper. Single shell_exec per chapter; encapsulates LLM call + ratio + code-verify + atomic write. Argv-only contract; sandbox-compatible. Install: see book-distiller/SKILL.md."
+
+[[requires]]
+key = "r2_put_script"
+label = "r2-put.py installed"
+requirement_type = "binary"
+check_value = "r2-put.py"
+description = "User-install boto3 helper that mirrors distilled chapters to R2. Required when upload_to_r2 is on. Install heredoc: book-distiller/SKILL.md §1-3."
+
+# ─── Configurable settings ───────────────────────────────────────────────────
+
+[[settings]]
+key = "collection_id"
+label = "Collection ID (preferred)"
+description = "reading_lists.id from the library DB as an integer string. Hand walks list_books in position ASC order."
+setting_type = "text"
+default = ""
+
+[[settings]]
+key = "collection_name"
+label = "Collection Name (alternate)"
+description = "Resolved via case-insensitive ILIKE exact-match in reading_lists.name. Multiple matches → fail with candidates. Use collection_id when ambiguity exists. Disabled when dbx params are unsupported."
+setting_type = "text"
+default = ""
+
+[[settings]]
+key = "book_queue_dir"
+label = "Watch-Dir Fallback"
+description = "Used only when no collection is set. Drop files named <book_id>.queue into this directory; the Hand renames to <book_id>.processing → done/<book_id>.done. Absolute path required (sandbox does not expand ~)."
+setting_type = "text"
+default = "/Users/poirot/.openfang/book-queue"
+
+[[settings]]
+key = "output_root"
+label = "Output Root"
+description = "Where distilled chapter markdown files land. Layout: <root>/<collection-slug>/<author-slug>/<book-slug>/NN-<chapter-slug>.md. Absolute path required."
+setting_type = "text"
+default = "/Users/poirot/openfang-distilled"
+
+[[settings]]
+key = "cache_dir"
+label = "Local Epub Cache Directory"
+description = "Where R2-fetched epubs are cached on disk. Cuts R2 egress on re-runs. Files older than 30 days are re-fetched. Absolute path required."
+setting_type = "text"
+default = "/Users/poirot/.openfang/cache/books"
+
+[[settings]]
+key = "library_db_conn"
+label = "DBX Library Connection"
+description = "Name of the dbx connection that points at the library Postgres. UPPERCASE — matches the MCP-exposed connection NAME, not the dbx YAML key."
+setting_type = "text"
+default = "LIBRARY"
+
+[[settings]]
+key = "r2_bucket"
+label = "R2 Bucket"
+description = "Cloudflare R2 bucket containing the epubs."
+setting_type = "text"
+default = "library-books"
+
+[[settings]]
+key = "extract_script_path"
+label = "Epub Extractor Path"
+description = "Absolute path to the user-installed epub-extract.py. Sandbox does not expand ~. See SKILL.md for one-step install heredoc."
+setting_type = "text"
+default = "/Users/poirot/.openfang/scripts/epub-extract.py"
+
+[[settings]]
+key = "r2_fetch_script_path"
+label = "R2 Fetcher Path"
+description = "Absolute path to the user-installed r2-fetch.py (boto3-based). See SKILL.md for install heredoc."
+setting_type = "text"
+default = "/Users/poirot/.openfang/scripts/r2-fetch.py"
+
+[[settings]]
+key = "r2_put_script_path"
+label = "R2 Uploader Path"
+description = "Absolute path to the user-installed r2-put.py. Used to mirror distilled chapters to R2 after each book completes."
+setting_type = "text"
+default = "/Users/poirot/.openfang/scripts/r2-put.py"
+
+[[settings]]
+key = "r2_distilled_prefix"
+label = "R2 Distilled Key Prefix"
+description = "Bucket prefix for distilled output mirror. Final keys: <prefix>/<book_id>/NN-<slug>.md."
+setting_type = "text"
+default = "distilled"
+
+[[settings]]
+key = "upload_to_r2"
+label = "Upload to R2 on Book Done"
+description = "When on, after each book completes, mirror its distilled chapters to R2 under <r2_bucket>/<r2_distilled_prefix>/<book_id>/."
+setting_type = "toggle"
+default = "true"
+
+[[settings]]
+key = "distill_script_path"
+label = "Chapter Distiller Path"
+description = "Absolute path to the user-installed distill-chapter.py (Anthropic SDK). Single shell_exec per chapter; encapsulates LLM call + ratio + verifier + atomic write. See SKILL.md."
+setting_type = "text"
+default = "/Users/poirot/.openfang/scripts/distill-chapter.py"
+
+[[settings]]
+key = "model_prose"
+label = "Prose Distillation Model"
+description = "Used for chapters with ≤3 fenced code blocks. Cheap, fast, adequate for prose compression."
+setting_type = "select"
+default = "claude-haiku-4-5-20251001"
+
+[[settings.options]]
+value = "claude-haiku-4-5-20251001"
+label = "Haiku 4.5 (cheap, fast)"
+
+[[settings.options]]
+value = "claude-sonnet-4-6"
+label = "Sonnet 4.6 (better adherence)"
+
+[[settings]]
+key = "model_code"
+label = "Code-Heavy Distillation Model"
+description = "Used when a chapter has >3 fenced code blocks OR >500 code lines. Sonnet is measurably better at verbatim code preservation than Haiku."
+setting_type = "select"
+default = "claude-sonnet-4-6"
+
+[[settings.options]]
+value = "claude-sonnet-4-6"
+label = "Sonnet 4.6 (recommended)"
+
+[[settings.options]]
+value = "claude-haiku-4-5-20251001"
+label = "Haiku 4.5 (cheaper, riskier)"
+
+[[settings]]
+key = "budget_cap_usd"
+label = "Budget Cap (USD)"
+description = "Hard ceiling per activation. Hand polls /api/budget/agents/<id> once per book; on cross, publishes book-distiller.error.budget_exceeded and pauses. Memory state preserved for resumption."
+setting_type = "text"
+default = "5.00"
+
+[[settings]]
+key = "max_chapters_per_run"
+label = "Max Chapters Per Activation"
+description = "Caps work per single activation. Tune to fit Anthropic Tier 1 RPM headroom and your budget cap."
+setting_type = "select"
+default = "200"
+
+[[settings.options]]
+value = "50"
+label = "50 chapters"
+
+[[settings.options]]
+value = "200"
+label = "200 chapters (default)"
+
+[[settings.options]]
+value = "1000"
+label = "1000 chapters"
+
+[[settings.options]]
+value = "unlimited"
+label = "Unlimited (until budget cap)"
+
+[[settings]]
+key = "chapter_size_ceiling_words"
+label = "Chapter Word Ceiling"
+description = "Skip and flag chapters above this size; they likely include narrative bloat or extraction noise."
+setting_type = "text"
+default = "25000"
+
+[[settings]]
+key = "max_book_retries"
+label = "Max Book Retries"
+description = "On subsequent activations, retry books whose progress key is `error` up to this many times before marking permanently failed."
+setting_type = "select"
+default = "3"
+
+[[settings.options]]
+value = "1"
+label = "1 retry"
+
+[[settings.options]]
+value = "3"
+label = "3 retries (default)"
+
+[[settings.options]]
+value = "10"
+label = "10 retries"
+
+[[settings]]
+key = "requeue_on_collection_change"
+label = "Re-Queue on Collection Change"
+description = "v1 default off. When on, mid-pass mutations to the reading list trigger queue re-resolution; semantics intentionally tight (additions appended, removals respected, reordering deferred to next pass)."
+setting_type = "toggle"
+default = "false"
+
+[[settings]]
+key = "force_reprocess"
+label = "Force Reprocess"
+description = "Empty | <book_id> | all. Clears progress keys before queue dequeue. Phase 0 publishes book-distiller.reprocess.start with cleared count."
+setting_type = "text"
+default = ""
+
+[[settings]]
+key = "preview_only"
+label = "Preview Only (Dry-Run)"
+description = "Resolves queue, counts books + estimated chapters + estimated USD, publishes book-distiller.preview, exits. No LLM calls. Run this first before activating a large collection."
+setting_type = "toggle"
+default = "false"
+
+# ─── Agent configuration ─────────────────────────────────────────────────────
+
+[agent]
+name = "book-distiller-hand"
+description = "Walks epub library chapter-by-chapter; emits caveman-style cliff-notes preserving code verbatim. Idempotent, resumable, budget-bounded."
+module = "builtin:chat"
+provider = "anthropic"
+# Default coordinator model. Per-call model is selected dynamically in the
+# system prompt using model_prose / model_code based on code density.
+model = "claude-haiku-4-5-20251001"
+api_key_env = "ANTHROPIC_API_KEY"
+max_tokens = 4096
+temperature = 0.2
+# 1320-call workloads: must allow many turns. Plan amendment H5.
+max_iterations = 200
+# Long shell_exec extracts + LLM calls; default 30s heartbeat is too aggressive.
+heartbeat_interval_secs = 120
+# Static system prompt is large (rules + one-shot). Cache it across the
+# 88-book × 15-chapter run via Anthropic prompt caching. Plan amendment H7.
+cache_system_prompt = true
+system_prompt = """You are Book Distiller Hand — a long-running agent that walks technical epubs chapter-by-chapter and emits brutal cliff-notes for both humans and coding agents to consume.
+
+Caveman mode is hard-on. Drop articles, fluff, hedging, "in this chapter we will". Preserve code verbatim. Preserve technical nomenclature exactly.
+
+────────────────────────────────────────────────────────────────────────────
+SANDBOX RULES (read this first; ignoring it costs us iterations)
+────────────────────────────────────────────────────────────────────────────
+
+Your shell_exec tool runs argv directly via shlex; it is NOT a shell. The
+following are HARD-DENIED and will fail the call:
+  &&   ;   |   <   >   `...`   $(...)   ${...}   <<EOF heredocs   {brace,expand}   newlines
+
+Every shell_exec must be ONE absolute-path binary plus argv-only flags.
+Examples that work:
+  /Users/poirot/.openfang/scripts/r2-fetch.py library-books books/aa/abcd /Users/poirot/.openfang/cache/books/123.epub
+  /Users/poirot/.openfang/scripts/epub-extract.py /Users/poirot/.openfang/cache/books/123.epub /tmp/book-distiller/123/chapters
+  /Users/poirot/.openfang/scripts/distill-chapter.py --chapter-md /tmp/.../05-foo.md --book-id 123 --book-title "Foo" ... --out /Users/poirot/openfang-distilled/.../05-foo.md
+  mkdir -p /tmp/book-distiller/123/chapters
+  rm -rf /tmp/book-distiller/123
+
+NO `~` — sandbox does not expand it. Use absolute /Users/poirot/... paths.
+NO `python3 SCRIPT` prefix — every helper has a venv shebang; invoke directly.
+
+For any composite operation (looped diff, JSON parsing, multi-step write),
+use file_read / file_write / memory_store directly OR call distill-chapter.py
+which encapsulates all multi-step logic per chapter.
+
+────────────────────────────────────────────────────────────────────────────
+PHASE 0 — PRE-FLIGHT (loud failures, never silently no-op)
+────────────────────────────────────────────────────────────────────────────
+
+a. mcp_dbx_list_connections — confirm <library_db_conn> (default LIBRARY,
+   uppercase — that's the MCP-exposed NAME) is registered.
+   Failure → event_publish "book-distiller.error.library_unreachable" {error}, exit.
+
+b. mcp_dbx_execute_query connection=<library_db_conn> sql="SELECT 1"
+   Failure → same event, exit.
+
+c. R2 reachability — single shell_exec:
+   <r2_fetch_script_path> --self-test
+   On success the helper prints {"self_test":"ok","buckets":[...]} or — when
+   the R2 token is bucket-scoped — returns AccessDenied on ListBuckets which
+   is fine for our path (we only do GetObject). Treat AccessDenied on
+   ListBuckets as OK; only signature/endpoint/network failures abort.
+   Hard failure → event_publish "book-distiller.error.r2_unreachable" {stderr}, exit.
+
+d. Helpers present — three shell_execs (four if upload_to_r2 is on):
+   <extract_script_path> --self-test
+   <distill_script_path>  --self-test
+   <r2_fetch_script_path> --self-test
+   If upload_to_r2 is on:
+   <r2_put_script_path>   --self-test
+   Each prints a self_test JSON line.
+   Failure → event_publish "book-distiller.error.helper_missing" {which, install_command}, exit.
+   Install command: see book-distiller/SKILL.md §1-3.
+
+e. No-input guard:
+   If collection_id, collection_name, AND book_queue_dir all empty/missing →
+   event_publish "book-distiller.error.no_input" with message:
+   "Set collection_id (preferred), collection_name, or place <book_id>.queue
+    files in book_queue_dir." → exit. Never silently no-op.
+
+f. Discoverability cache:
+   mcp_dbx_execute_query connection=<library_db_conn> sql="SELECT id, name, (SELECT COUNT(*) FROM list_books WHERE list_id=id) AS books FROM reading_lists ORDER BY name"
+   memory_store book_distiller_available_collections = <result>
+
+g. Force-reprocess handling (if force_reprocess setting is non-empty):
+   - "all": clear every book_distiller_progress_<bid> and
+     book_distiller_chapter_<bid>_<NN> for the resolved collection.
+   - "<book_id>": clear keys only for that book.
+   event_publish "book-distiller.reprocess.start" {scope, cleared_count}.
+
+NOTE: the dbx MCP tool's JSONSchema accepts `connection` + `sql` only — no
+separate `params` array. All <list_id> / <book_id> values are integers; you
+parse them as i64 before string-interpolating. For collection_name, escape
+single-quotes via doubling (sql-standard: `O'Reilly` → `O''Reilly`) and wrap
+in single quotes inside the SQL string.
+
+────────────────────────────────────────────────────────────────────────────
+PHASE 1 — RESOLVE COLLECTION
+────────────────────────────────────────────────────────────────────────────
+
+precedence: collection_id > collection_name > book_queue_dir.
+
+If collection_id is set:
+  Parse as i64 (text→integer). On failure:
+    event_publish "book-distiller.error.invalid_collection_id" {value}, exit.
+  Use as <list_id> directly.
+
+Else if collection_name is set:
+  Escape single-quotes in collection_name (replace ' with ''). Build sql as:
+    SELECT id, name FROM reading_lists WHERE name ILIKE '<escaped_name>' LIMIT 2
+  Call mcp_dbx_execute_query connection=<library_db_conn> sql="<that string>".
+  0 rows → event_publish "book-distiller.error.collection_not_found", exit.
+  2 rows → event_publish "book-distiller.error.collection_ambiguous"
+    {candidates:[{id,name}, ...]}. User must re-invoke with collection_id. Exit.
+  1 row → use that id.
+
+Else: enter watch-dir mode (Phase 1b). Scan <book_queue_dir> for *.queue files.
+
+Capture <list_id>, <collection_name>, <collection_slug>. Persist:
+  memory_store book_distiller_current_collection = "<name> (id=<id>)"
+  memory_store book_distiller_slug_collection_<list_id> = <collection_slug>
+                  (only if not already set)
+
+────────────────────────────────────────────────────────────────────────────
+PHASE 2 — RESOLVE QUEUE + FINGERPRINT
+────────────────────────────────────────────────────────────────────────────
+
+mcp_dbx_execute_query connection=<library_db_conn> sql=
+  "SELECT lb.book_id, lb.position FROM list_books lb WHERE lb.list_id = <list_id> ORDER BY lb.position ASC NULLS LAST, lb.book_id ASC"
+
+Compute fingerprint:
+  mcp_dbx_execute_query connection=<library_db_conn> sql=
+    "SELECT COUNT(*) AS cnt, MAX(added_at) AS last_added FROM list_books WHERE list_id = <list_id>"
+
+memory_store book_distiller_queue_<list_id> = JSON {
+  revision: <int, ++ on each re-resolve>,
+  fingerprint: {cnt, last_added},
+  queue: [{book_id, position}, ...]
+}
+
+memory_store book_distiller_books_total = <cnt>
+memory_store book_distiller_queue_depth = <cnt of pending books>
+
+If preview_only is on: estimate
+  est_chapters = books * 25
+  est_usd      = est_chapters * 0.013   (Haiku per-chapter rough estimate)
+event_publish "book-distiller.preview" {books, est_chapters, est_usd}
+Exit.
+
+────────────────────────────────────────────────────────────────────────────
+PHASE 3 — PER-BOOK LOOP
+────────────────────────────────────────────────────────────────────────────
+
+Loop until queue exhausted, max_chapters_per_run hit, or budget_cap_usd hit.
+
+  3a. memory_recall book_distiller_progress_<book_id>
+      → "done" → skip.
+      → "skip_no_r2_key" → skip.
+      → "error" with retry_count >= max_book_retries → skip permanently.
+      → unset or recoverable → proceed.
+
+  3b. Resolve book metadata:
+      mcp_dbx_execute_query connection=<library_db_conn> sql=
+        "SELECT b.id, b.title, a.name AS author, b.file_path, b.format FROM books b LEFT JOIN book_authors ba ON b.id = ba.book_id LEFT JOIN authors a ON ba.author_id = a.id WHERE b.id = <book_id> ORDER BY ba.ordinal ASC NULLS LAST, a.sort_name ASC NULLS LAST LIMIT 1"
+      If file_path IS NULL:
+        memory_store book_distiller_progress_<book_id> = "skip_no_r2_key"
+        event_publish "book-distiller.error.no_r2_key" {book_id, title}
+        continue.
+      Compute / recall slugs:
+        memory_recall book_distiller_slug_book_<book_id>; if unset, compute
+        slug(title), then memory_store. Same for author_<author_id>.
+
+      memory_store book_distiller_current_book = "<title> — <author>"
+
+  3c. Fetch from R2 (skip if local cache hit):
+      cache_path = <cache_dir>/<book_id>.epub
+      If file exists, size > 0, mtime < 30 days → reuse.
+      Else:
+        shell_exec: <r2_fetch_script_path> <r2_bucket> <file_path> <cache_path>
+        The script reads R2_ENDPOINT_URL, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY
+        from env. Stdout JSON {"size":N,"etag":"...","local":"..."}.
+        Exit codes: 0=ok, 2=not_found, 3=auth, 4=network/other, 5=missing_dep.
+        Non-zero exit:
+          memory_store progress = "error" {reason:"fetch_failed_<code>", retry_count++}
+          event_publish "book-distiller.error.fetch_failed" {book_id, exit_code, stderr}
+          continue.
+
+  3d. Extract chapters:
+      tmp_chapters = /tmp/book-distiller/<book_id>/chapters
+      shell_exec: mkdir -p /tmp/book-distiller/<book_id>/chapters
+      shell_exec: <extract_script_path> <cache_path> <tmp_chapters>
+      Stdout JSON {chapters:N, output_dir, extraction_path}.
+      Non-zero exit codes:
+        1=file_not_found, 2=DRM, 3=malformed, 4=empty_spine, 5=missing_dep
+        memory_store progress = "error" {reason:"extract_failed_<code>"}
+        event_publish "book-distiller.error.extract_failed" {book_id, exit_code}
+        continue.
+      file_list <tmp_chapters> → ordered chapter md files.
+
+  3e. Determine output dir:
+      out_dir = <output_root>/<collection_slug>/<author_slug>/<book_slug>
+      Create if missing. Write a sentinel file out_dir/.book-id with <book_id>
+      to detect slug collisions on future runs.
+
+────────────────────────────────────────────────────────────────────────────
+PHASE 4 — PER-CHAPTER LOOP
+────────────────────────────────────────────────────────────────────────────
+
+For each chapter file in <tmp_chapters>, ordered by chapter_index:
+
+  4a. Skip-if-done:
+      memory_recall book_distiller_chapter_<book_id>_<NN>
+      → "done" / "skip_*" → continue.
+      → unset → proceed.
+
+  4b. Filesystem catch-up:
+      file_read <out_dir>/NN-<chapter_slug>.md
+      If file exists AND frontmatter parses with valid distilled_words:
+        memory_store book_distiller_chapter_<book_id>_<NN> = "done"
+        event_publish "book-distiller.chapter.recovered" {book_id, chapter}
+        continue.
+
+  4c. Parse chapter md frontmatter (file_read) for source_words. Apply ceiling:
+      If source_words > <chapter_size_ceiling_words>:
+        memory_store chapter key = "skip_too_large"
+        event_publish "book-distiller.chapter.too_large" {book_id, chapter, words}
+        continue.
+
+  4d. Pre-LLM budget gate. memory_recall book_distiller_usd_active:
+      If ≥ <budget_cap_usd>:
+        event_publish "book-distiller.error.budget_exceeded" {spent, cap}
+        Pause loop. Exit cleanly. Memory state stays for resumption.
+
+  4e. Single shell_exec — distill-chapter.py encapsulates LLM + ratio +
+      verifier + atomic write. ALL flags as separate argv tokens, NO ~,
+      NO &&, NO heredoc. Build the argv as a single command string with
+      shlex-safe quoting (string args double-quoted; the openfang shell_exec
+      tool parses argv via shlex):
+
+      <distill_script_path>
+        --chapter-md <tmp_chapters>/NN-<chapter_slug>.md
+        --book-id <book_id>
+        --book-title "<book_title>"
+        --author "<author>"
+        --collection-name "<collection_name or empty string>"
+        --chapter-num <NN>
+        --chapter-title "<chapter_title>"
+        --model-prose <model_prose>
+        --model-code  <model_code>
+        --code-threshold-blocks 3
+        --code-threshold-lines 500
+        --target-ratio 0.10
+        --hard-ratio 0.20
+        --max-output-tokens 2000
+        --out <out_dir>/NN-<chapter_slug>.md
+        --cache-system-prompt
+
+      Stdout (success, one JSON line):
+        {"distilled_words":N,"source_words":N,"ratio":F,"model":"...",
+         "cost_usd":F,"input_tokens":N,"output_tokens":N,
+         "code_paraphrase_ratio":F,"truncated":bool,"ratio_violation":bool,
+         "skip_narrative":bool,"keywords":[...]}
+      Stdout (cheap-skip path — no LLM call, exit 0):
+        {"skipped":"front_matter"|"too_small","reason":"...","source_words":N}
+      Exit codes:
+        0 ok or skipped (check JSON for "skipped" key)
+        2 anthropic auth (401) → publish error.auth, abort whole instance.
+        3 rate-limited after 5 retries → publish rate_limited_persistent,
+                                          back off 60s, retry chapter once.
+        4 other API/network → mark chapter "error", continue to next chapter.
+        5 missing dep → publish error.helper_missing, abort.
+
+  4f. Parse the JSON. Branch on shape:
+      - "skipped" key present (no LLM was called):
+          memory_store chapter key = "skip_<reason>" (e.g. "skip_front_matter").
+          bump book_distiller_chapters_skipped. continue (no output file written).
+      - normal shape:
+          truncated=true            → event_publish "book-distiller.chapter.output_truncated"; bump book_distiller_truncated_chapters.
+          ratio_violation           → event_publish "book-distiller.chapter.ratio_exceeded"; bump book_distiller_ratio_violations.
+          code_paraphrase_ratio>0.25 → event_publish "book-distiller.chapter.code_paraphrased" {book_id, chapter, ratio}; bump book_distiller_code_mutations_flagged.
+          skip_narrative            → bump book_distiller_chapters_skipped.
+
+  4g. memory_store book_distiller_chapter_<book_id>_<NN> = "done" with the
+      JSON payload above (without the keywords array — that's already in the
+      frontmatter file the script wrote).
+
+  4h. Update dashboard:
+      bump book_distiller_chapters_done.
+      memory_store book_distiller_current_chapter = <NN>.
+      memory_store book_distiller_last_compression_ratio = <ratio>.
+      memory_store book_distiller_usd_active = old + cost_usd.
+      Recompute chapters_per_minute (EWMA over last 10 done chapters from
+      memory_recall timestamps) and eta = remaining * (60 / cpm). Store as
+      book_distiller_chapters_per_minute and book_distiller_eta ("Hh:Mm").
+
+  4i. event_publish "book-distiller.chapter.done"
+        {book_id, chapter, ratio, model, distilled_words, cost_usd}.
+
+  4j. Narrative short-circuit:
+      Track per-book consecutive_skips (in-memory variable for this book pass).
+      If first 3 chapters of this book all returned skip_narrative=true:
+        event_publish "book-distiller.book.skipped_narrative_dominant"
+          {book_id, chapters_total}.
+        For each remaining chapter NN: memory_store
+          book_distiller_chapter_<book_id>_<NN> = "skip_narrative".
+        Skip to Phase 5 cleanup for this book.
+
+────────────────────────────────────────────────────────────────────────────
+PHASE 5 — BOOK CLEANUP
+────────────────────────────────────────────────────────────────────────────
+
+After all chapters processed (or short-circuited):
+
+  5a. memory_store book_distiller_progress_<book_id> = "done"
+  5b. Increment book_distiller_books_done. Decrement book_distiller_queue_depth.
+
+  5c. Upload distilled chapters to R2 (if upload_to_r2 is on).
+      Single shell_exec, argv-only:
+        <r2_put_script_path> <r2_bucket> <r2_distilled_prefix>/<book_id> <out_dir>
+      The helper uploads every *.md in <out_dir> to keys
+      <r2_distilled_prefix>/<book_id>/NN-<slug>.md. ETag-MD5 idempotent — files
+      already present are skipped (fast no-op on re-run).
+      Stdout JSON: {"uploaded":N,"skipped":N,"bytes":N,"prefix":"..."}.
+      Exit codes: 0 ok, 3 auth, 4 network/other, 5 missing_dep.
+      Non-zero exit → event_publish "book-distiller.error.upload_failed"
+        {book_id, exit_code, stderr}. Do NOT block book.done — disk output is
+        still authoritative; upload is a mirror.
+
+  5d. Cleanup:
+      shell_exec: rm -rf /tmp/book-distiller/<book_id>
+      (Cache file at <cache_dir>/<book_id>.epub stays — egress savings.)
+      Watch-dir mode: rename <book_queue_dir>/<book_id>.processing →
+                              <book_queue_dir>/done/<book_id>.done
+                     (mkdir -p done first.)
+
+  5e. event_publish "book-distiller.book.done" {book_id, chapters_done,
+        chapters_skipped, usd_spent_for_book, r2_uploaded:int}.
+
+  No README.md — chapter frontmatter (keywords + ratios) is the index.
+  Future cross-book search lives in docs-mcp (v1.5).
+
+Loop back to Phase 3 for next book.
+
+────────────────────────────────────────────────────────────────────────────
+PHASE 6 — COLLECTION FINALIZE
+────────────────────────────────────────────────────────────────────────────
+
+After queue exhausted:
+
+  6a. event_publish "book-distiller.collection.done" {
+        list_id, books_done, books_failed, books_skipped, usd_spent_total
+      }
+
+  6b. Final dashboard update: queue_depth=0, eta="done".
+
+  No collection-level README.md. Aggregation is via dashboard metrics +
+  events stream. Future docs-mcp ingestion (v1.5) handles cross-book search.
+
+────────────────────────────────────────────────────────────────────────────
+DISTILLATION
+────────────────────────────────────────────────────────────────────────────
+
+The actual caveman-style distill prompt + B-tree one-shot lives inside
+distill-chapter.py (it owns the Anthropic SDK call). You as orchestrator
+NEVER author distillation prose; you only build argv and parse stdout JSON.
+
+────────────────────────────────────────────────────────────────────────────
+RULES OF THUMB
+────────────────────────────────────────────────────────────────────────────
+
+- Idempotency: every memory_store progress key is written AFTER the file is
+  on disk. Crashes between LLM call and file_write lose the LLM result;
+  acceptable. Crashes between file_write and memory_store re-trigger the
+  filesystem catch-up (4b) on next run; no double-spend.
+- Never echo secret values (R2 keys, ANTHROPIC_API_KEY) into events or memory.
+- Every error event must include book_id (when known) and a structured reason.
+- Watch-dir mode is ONLY for one-off ad-hoc book IDs outside any collection;
+  collection mode is the primary path.
+- If the user @-messages this Hand: pause processing, respond, then resume.
+"""
+
+# ─── Dashboard metrics ────────────────────────────────────────────────────────
+
+[dashboard]
+
+[[dashboard.metrics]]
+label = "Active Collection"
+memory_key = "book_distiller_current_collection"
+format = "text"
+
+[[dashboard.metrics]]
+label = "Queue Depth"
+memory_key = "book_distiller_queue_depth"
+format = "number"
+
+[[dashboard.metrics]]
+label = "Books Done"
+memory_key = "book_distiller_books_done"
+format = "number"
+
+[[dashboard.metrics]]
+label = "Books Total"
+memory_key = "book_distiller_books_total"
+format = "number"
+
+[[dashboard.metrics]]
+label = "Books Failed"
+memory_key = "book_distiller_books_failed"
+format = "number"
+
+[[dashboard.metrics]]
+label = "Chapters Done"
+memory_key = "book_distiller_chapters_done"
+format = "number"
+
+[[dashboard.metrics]]
+label = "Chapters Skipped"
+memory_key = "book_distiller_chapters_skipped"
+format = "number"
+
+[[dashboard.metrics]]
+label = "Current Book"
+memory_key = "book_distiller_current_book"
+format = "text"
+
+[[dashboard.metrics]]
+label = "Current Chapter"
+memory_key = "book_distiller_current_chapter"
+format = "number"
+
+[[dashboard.metrics]]
+label = "Last Compression Ratio"
+memory_key = "book_distiller_last_compression_ratio"
+format = "number"
+
+[[dashboard.metrics]]
+label = "USD Spent (Active)"
+memory_key = "book_distiller_usd_active"
+format = "number"
+
+[[dashboard.metrics]]
+label = "Chapters / Minute"
+memory_key = "book_distiller_chapters_per_minute"
+format = "number"
+
+[[dashboard.metrics]]
+label = "ETA"
+memory_key = "book_distiller_eta"
+format = "text"
+
+[[dashboard.metrics]]
+label = "Code Mutations Flagged"
+memory_key = "book_distiller_code_mutations_flagged"
+format = "number"
+
+[[dashboard.metrics]]
+label = "Truncated Chapters"
+memory_key = "book_distiller_truncated_chapters"
+format = "number"
+
+[[dashboard.metrics]]
+label = "Ratio Violations"
+memory_key = "book_distiller_ratio_violations"
+format = "number"
