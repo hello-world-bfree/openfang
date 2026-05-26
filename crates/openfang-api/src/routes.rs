@@ -3421,6 +3421,124 @@ pub async fn delete_agent_kv_key(
     }
 }
 
+/// GET /api/memory/summary — v1.5 substrate snapshot.
+///
+/// Returns active/superseded/contested counts, instruction-bearing flag count,
+/// per-depth histogram, and the 10 most recent failure fingerprints.
+pub async fn memory_summary(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let memory = state.kernel.memory.clone();
+    match tokio::task::spawn_blocking(move || memory.memory_summary()).await {
+        Ok(Ok(json)) => (StatusCode::OK, Json(json)),
+        Ok(Err(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("join error: {e}")})),
+        ),
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct MemoryListQuery {
+    #[serde(default)]
+    pub flagged: bool,
+    pub max_depth: Option<i64>,
+}
+
+/// GET /api/memory/list?flagged=<bool>&max_depth=<n> — list active memories.
+pub async fn memory_list_active(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<MemoryListQuery>,
+) -> impl IntoResponse {
+    let memory = state.kernel.memory.clone();
+    let flagged = q.flagged;
+    let max_depth = q.max_depth;
+    match tokio::task::spawn_blocking(move || {
+        memory.list_memories_for_operator(flagged, max_depth)
+    })
+    .await
+    {
+        Ok(Ok(rows)) => (StatusCode::OK, Json(serde_json::json!({"memories": rows}))),
+        Ok(Err(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("join error: {e}")})),
+        ),
+    }
+}
+
+/// GET /api/memory/:id — full row + lineage chain for one memory.
+pub async fn memory_show(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let memory = state.kernel.memory.clone();
+    let id_owned = id.clone();
+    match tokio::task::spawn_blocking(move || memory.show_memory(&id_owned)).await {
+        Ok(Ok(Some(row))) => (StatusCode::OK, Json(row)),
+        Ok(Ok(None)) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "memory not found", "id": id})),
+        ),
+        Ok(Err(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("join error: {e}")})),
+        ),
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct MemoryPatchBody {
+    pub is_instruction_bearing: Option<bool>,
+}
+
+/// PATCH /api/memory/:id — operator opt-in for a flagged row.
+///
+/// Setting `is_instruction_bearing=false` restores the row to retrieval (the
+/// SEC-01 default flagged-on-classifier behavior). Setting it back to true is
+/// available for testing or manual quarantine.
+pub async fn memory_patch_flag(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<MemoryPatchBody>,
+) -> impl IntoResponse {
+    let Some(flag) = body.is_instruction_bearing else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "body requires { is_instruction_bearing: bool }"
+            })),
+        );
+    };
+    let memory = state.kernel.memory.clone();
+    let id_owned = id.clone();
+    match tokio::task::spawn_blocking(move || memory.set_instruction_bearing(&id_owned, flag))
+        .await
+    {
+        Ok(Ok(())) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"id": id, "is_instruction_bearing": flag})),
+        ),
+        Ok(Err(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("join error: {e}")})),
+        ),
+    }
+}
+
 /// GET /api/health — Minimal liveness probe (public, no auth required).
 /// Returns only status and version to prevent information leakage.
 /// Use GET /api/health/detail for full diagnostics (requires auth).

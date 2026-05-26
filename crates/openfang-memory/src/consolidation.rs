@@ -24,6 +24,12 @@ impl ConsolidationEngine {
     }
 
     /// Run a consolidation cycle: decay old memories.
+    ///
+    /// v1.5: decay measures from `COALESCE(event_time, created_at)` — when the
+    /// fact was learned — rather than from `accessed_at`. Decay on
+    /// `accessed_at` would artificially refresh a stale fact every time it was
+    /// recalled, defeating the whole point. (Per `Designing Data-Intensive
+    /// Applications` §11.4 bitemporal Bug 1.)
     pub fn consolidate(&self) -> OpenFangResult<ConsolidationReport> {
         let start = std::time::Instant::now();
         let conn = self
@@ -31,14 +37,16 @@ impl ConsolidationEngine {
             .lock()
             .map_err(|e| OpenFangError::Internal(e.to_string()))?;
 
-        // Decay confidence of memories not accessed in the last 7 days
+        // Decay confidence of memories whose `event_time` is more than 7 days old.
         let cutoff = (Utc::now() - chrono::Duration::days(7)).to_rfc3339();
         let decay_factor = 1.0 - self.decay_rate as f64;
 
         let decayed = conn
             .execute(
                 "UPDATE memories SET confidence = MAX(0.1, confidence * ?1)
-                 WHERE deleted = 0 AND accessed_at < ?2 AND confidence > 0.1",
+                 WHERE deleted = 0
+                   AND COALESCE(event_time, created_at) < ?2
+                   AND confidence > 0.1",
                 rusqlite::params![decay_factor, cutoff],
             )
             .map_err(|e| OpenFangError::Memory(e.to_string()))?;

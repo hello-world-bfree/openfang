@@ -325,6 +325,20 @@ pub async fn build_router(
                 .put(routes::set_agent_kv_key)
                 .delete(routes::delete_agent_kv_key),
         )
+        // v1.5 substrate operator surface
+        .route(
+            "/api/memory/summary",
+            axum::routing::get(routes::memory_summary),
+        )
+        .route(
+            "/api/memory/list",
+            axum::routing::get(routes::memory_list_active),
+        )
+        .route(
+            "/api/memory/{id}",
+            axum::routing::get(routes::memory_show)
+                .patch(routes::memory_patch_flag),
+        )
         // Trigger endpoints
         .route(
             "/api/triggers",
