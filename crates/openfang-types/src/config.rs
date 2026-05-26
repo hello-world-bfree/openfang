@@ -1644,6 +1644,14 @@ pub struct MemoryConfig {
     /// Env var name holding the HTTP memory API bearer token.
     #[serde(default)]
     pub http_token_env: Option<String>,
+    /// Distill durable "learnings" from each successful run via a cheap LLM call.
+    /// Opt-in: adds one extra model call per run.
+    #[serde(default)]
+    pub curator_enabled: bool,
+    /// Skip distillation when the run's own estimated cost exceeds this many USD.
+    /// Avoids stacking a Curator call onto an already-expensive run.
+    #[serde(default = "default_curator_cost_cap")]
+    pub curator_cost_cap_usd: f64,
 }
 
 fn default_consolidation_interval() -> u64 {
@@ -1652,6 +1660,10 @@ fn default_consolidation_interval() -> u64 {
 
 fn default_memory_backend() -> String {
     "sqlite".to_string()
+}
+
+fn default_curator_cost_cap() -> f64 {
+    0.05
 }
 
 impl Default for MemoryConfig {
@@ -1667,6 +1679,8 @@ impl Default for MemoryConfig {
             backend: default_memory_backend(),
             http_url: None,
             http_token_env: None,
+            curator_enabled: false,
+            curator_cost_cap_usd: default_curator_cost_cap(),
         }
     }
 }

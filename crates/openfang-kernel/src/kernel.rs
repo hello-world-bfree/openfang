@@ -2055,6 +2055,9 @@ impl OpenFangKernel {
         };
 
         let driver = self.resolve_driver(&entry.manifest)?;
+        // Curator: clone the driver for post-run distillation (opt-in). Must be
+        // captured before `driver` is moved into the streaming loop below.
+        let curator_driver = self.config.memory.curator_enabled.then(|| driver.clone());
 
         // Look up model's actual context window from the catalog
         let ctx_window = self.model_catalog.read().ok().and_then(|cat| {
@@ -2381,6 +2384,21 @@ impl OpenFangKernel {
                             cost_usd: cost,
                             tool_calls: result.iterations.saturating_sub(1),
                         });
+
+                    // Curator: distill durable learnings from this run (opt-in, cost-gated).
+                    if let Some(curator_driver) = curator_driver {
+                        if !result.silent && cost <= kernel_clone.config.memory.curator_cost_cap_usd
+                        {
+                            openfang_runtime::curator::distill_learnings(
+                                &memory,
+                                agent_id,
+                                model,
+                                curator_driver,
+                                &session.messages,
+                            )
+                            .await;
+                        }
+                    }
 
                     let _ = kernel_clone
                         .registry
@@ -2857,6 +2875,7 @@ impl OpenFangKernel {
         }
 
         let driver = self.resolve_driver(&manifest)?;
+        let curator_driver = self.config.memory.curator_enabled.then(|| driver.clone());
 
         // Look up model's actual context window from the catalog
         let ctx_window = self.model_catalog.read().ok().and_then(|cat| {
@@ -2950,6 +2969,20 @@ impl OpenFangKernel {
             cost_usd: cost,
             tool_calls: result.iterations.saturating_sub(1),
         });
+
+        // Curator: distill durable learnings from this run (opt-in, cost-gated).
+        if let Some(curator_driver) = curator_driver {
+            if !result.silent && cost <= self.config.memory.curator_cost_cap_usd {
+                openfang_runtime::curator::distill_learnings(
+                    &self.memory,
+                    agent_id,
+                    model,
+                    curator_driver,
+                    &session.messages,
+                )
+                .await;
+            }
+        }
 
         // Populate cost on the result based on usage_footer mode
         let mut result = result;
@@ -3812,10 +3845,11 @@ impl OpenFangKernel {
         for req in &def.requires {
             match req.requirement_type {
                 openfang_hands::RequirementType::ApiKey
-                | openfang_hands::RequirementType::EnvVar => {
-                    if !req.check_value.is_empty() && !allowed_env.contains(&req.check_value) {
-                        allowed_env.push(req.check_value.clone());
-                    }
+                | openfang_hands::RequirementType::EnvVar
+                    if !req.check_value.is_empty()
+                        && !allowed_env.contains(&req.check_value) =>
+                {
+                    allowed_env.push(req.check_value.clone());
                 }
                 _ => {}
             }
@@ -4182,7 +4216,7 @@ impl OpenFangKernel {
         let mut bindings = self.bindings.lock().unwrap_or_else(|e| e.into_inner());
         bindings.push(binding);
         // Sort by specificity descending
-        bindings.sort_by(|a, b| b.match_rule.specificity().cmp(&a.match_rule.specificity()));
+        bindings.sort_by_key(|b| std::cmp::Reverse(b.match_rule.specificity()));
     }
 
     /// Remove a binding by index, returns the removed binding if valid.

@@ -502,36 +502,36 @@ impl MemorySubstrate {
         let agent_id = agent_id.to_string();
 
         tokio::task::spawn_blocking(move || {
-            let db = conn.lock().map_err(|e| OpenFangError::Internal(e.to_string()))?;
-            // Find first pending task assigned to this agent, or any unassigned pending task
-            let mut stmt = db.prepare(
-                "SELECT id, title, description, assigned_to, created_by, created_at
-                 FROM task_queue
-                 WHERE status = 'pending' AND (assigned_to = ?1 OR assigned_to = '')
-                 ORDER BY priority DESC, created_at ASC
-                 LIMIT 1"
-            ).map_err(|e| OpenFangError::Memory(e.to_string()))?;
+            let mut db = conn.lock().map_err(|e| OpenFangError::Internal(e.to_string()))?;
+            let tx = db
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(|e| OpenFangError::Memory(e.to_string()))?;
 
-            let result = stmt.query_row(rusqlite::params![agent_id], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, String>(5)?,
-                ))
-            });
+            let result = tx.query_row(
+                "UPDATE task_queue SET status = 'in_progress', assigned_to = ?1
+                 WHERE id = (
+                     SELECT id FROM task_queue
+                     WHERE status = 'pending' AND (assigned_to = ?1 OR assigned_to = '')
+                     ORDER BY priority DESC, created_at ASC
+                     LIMIT 1
+                 )
+                 RETURNING id, title, description, assigned_to, created_by, created_at",
+                rusqlite::params![agent_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                },
+            );
 
-            match result {
+            let claimed = match result {
                 Ok((id, title, description, assigned, created_by, created_at)) => {
-                    // Update status to in_progress
-                    db.execute(
-                        "UPDATE task_queue SET status = 'in_progress', assigned_to = ?2 WHERE id = ?1",
-                        rusqlite::params![id, agent_id],
-                    ).map_err(|e| OpenFangError::Memory(e.to_string()))?;
-
-                    Ok(Some(serde_json::json!({
+                    Some(serde_json::json!({
                         "id": id,
                         "title": title,
                         "description": description,
@@ -539,11 +539,14 @@ impl MemorySubstrate {
                         "assigned_to": if assigned.is_empty() { &agent_id } else { &assigned },
                         "created_by": created_by,
                         "created_at": created_at,
-                    })))
+                    }))
                 }
-                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-                Err(e) => Err(OpenFangError::Memory(e.to_string())),
-            }
+                Err(rusqlite::Error::QueryReturnedNoRows) => None,
+                Err(e) => return Err(OpenFangError::Memory(e.to_string())),
+            };
+
+            tx.commit().map_err(|e| OpenFangError::Memory(e.to_string()))?;
+            Ok(claimed)
         })
         .await
         .map_err(|e| OpenFangError::Internal(e.to_string()))?
@@ -559,11 +562,22 @@ impl MemorySubstrate {
             let now = chrono::Utc::now().to_rfc3339();
             let db = conn.lock().map_err(|e| OpenFangError::Internal(e.to_string()))?;
             let rows = db.execute(
-                "UPDATE task_queue SET status = 'completed', result = ?2, completed_at = ?3 WHERE id = ?1",
+                "UPDATE task_queue SET status = 'completed', result = ?2, completed_at = ?3
+                 WHERE id = ?1 AND status != 'completed'",
                 rusqlite::params![task_id, result, now],
             ).map_err(|e| OpenFangError::Memory(e.to_string()))?;
             if rows == 0 {
-                return Err(OpenFangError::Internal(format!("Task not found: {task_id}")));
+                match db.query_row(
+                    "SELECT 1 FROM task_queue WHERE id = ?1",
+                    rusqlite::params![task_id],
+                    |_| Ok(()),
+                ) {
+                    Ok(()) => {}
+                    Err(rusqlite::Error::QueryReturnedNoRows) => {
+                        return Err(OpenFangError::Internal(format!("Task not found: {task_id}")));
+                    }
+                    Err(e) => return Err(OpenFangError::Memory(e.to_string())),
+                }
             }
             Ok(())
         })
@@ -820,5 +834,52 @@ mod tests {
         let substrate = MemorySubstrate::open_in_memory(0.1).unwrap();
         let claimed = substrate.task_claim("nobody").await.unwrap();
         assert!(claimed.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_task_claim_is_atomic_single_winner() {
+        let substrate = Arc::new(MemorySubstrate::open_in_memory(0.1).unwrap());
+        let task_id = substrate
+            .task_post("Solo task", "Only one claimer may win", None, None)
+            .await
+            .unwrap();
+
+        let a = {
+            let s = Arc::clone(&substrate);
+            tokio::spawn(async move { s.task_claim("agent-a").await.unwrap() })
+        };
+        let b = {
+            let s = Arc::clone(&substrate);
+            tokio::spawn(async move { s.task_claim("agent-b").await.unwrap() })
+        };
+        let (ra, rb) = (a.await.unwrap(), b.await.unwrap());
+
+        let winners = [&ra, &rb].iter().filter(|r| r.is_some()).count();
+        assert_eq!(winners, 1, "exactly one claimer must win the single task");
+        let winner = ra.or(rb).unwrap();
+        assert_eq!(winner["id"], task_id);
+        assert_eq!(winner["status"], "in_progress");
+
+        assert!(substrate.task_claim("agent-c").await.unwrap().is_none());
+        assert_eq!(substrate.task_list(Some("in_progress")).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_task_complete_is_idempotent() {
+        let substrate = MemorySubstrate::open_in_memory(0.1).unwrap();
+        let task_id = substrate
+            .task_post("Finalize me", "desc", Some("auditor"), None)
+            .await
+            .unwrap();
+        substrate.task_claim("auditor").await.unwrap();
+
+        substrate.task_complete(&task_id, "done").await.unwrap();
+        substrate.task_complete(&task_id, "done again").await.unwrap();
+
+        let tasks = substrate.task_list(Some("completed")).await.unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0]["result"], "done");
+
+        assert!(substrate.task_complete("no-such-task", "x").await.is_err());
     }
 }

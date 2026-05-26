@@ -506,16 +506,14 @@ async fn run_native(
                 matched_count += 1;
                 file_matched = true;
                 match mode {
-                    "content" => {
-                        if matched_count > skip && hits.len() < max_results {
-                            hits.push(CodeSearchHit {
-                                path: path.display().to_string(),
-                                line: (lineno + 1) as u64,
-                                col: (m.start() + 1) as u64,
-                                text: truncate_chars(line, MAX_TEXT_CHARS),
-                                ctx: Vec::new(),
-                            });
-                        }
+                    "content" if matched_count > skip && hits.len() < max_results => {
+                        hits.push(CodeSearchHit {
+                            path: path.display().to_string(),
+                            line: (lineno + 1) as u64,
+                            col: (m.start() + 1) as u64,
+                            text: truncate_chars(line, MAX_TEXT_CHARS),
+                            ctx: Vec::new(),
+                        });
                     }
                     "files" => {
                         // "files" mode: one hit per matched file; break after first.

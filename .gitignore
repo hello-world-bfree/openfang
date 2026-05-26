@@ -48,3 +48,4 @@ Thumbs.db
 
 # Personal deploy scripts
 scripts/deploy-remote.sh
+__to_delete/

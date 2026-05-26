@@ -589,6 +589,17 @@ pub async fn run_agent_loop(
         system_prompt.push_str(&crate::prompt_builder::build_memory_section(&mem_pairs));
     }
 
+    // Curator read-back: inject high-confidence distilled learnings, deduped
+    // against the general recall above. Empty when the curator is disabled.
+    let learnings = crate::curator::recall_learnings(memory, session.agent_id).await;
+    if !learnings.is_empty() {
+        let already_shown: Vec<String> = memories.iter().map(|m| m.content.clone()).collect();
+        if let Some(section) = crate::curator::build_learnings_section(&learnings, &already_shown) {
+            system_prompt.push_str("\n\n");
+            system_prompt.push_str(&section);
+        }
+    }
+
     // Add the user message to session history.
     // When content blocks are provided (e.g. text + image from a channel),
     // combine them with the user text so the LLM sees the full multimodal turn.
@@ -1769,6 +1780,17 @@ pub async fn run_agent_loop_streaming(
             .collect();
         system_prompt.push_str("\n\n");
         system_prompt.push_str(&crate::prompt_builder::build_memory_section(&mem_pairs));
+    }
+
+    // Curator read-back: inject high-confidence distilled learnings, deduped
+    // against the general recall above. Empty when the curator is disabled.
+    let learnings = crate::curator::recall_learnings(memory, session.agent_id).await;
+    if !learnings.is_empty() {
+        let already_shown: Vec<String> = memories.iter().map(|m| m.content.clone()).collect();
+        if let Some(section) = crate::curator::build_learnings_section(&learnings, &already_shown) {
+            system_prompt.push_str("\n\n");
+            system_prompt.push_str(&section);
+        }
     }
 
     // Add the user message to session history.
