@@ -1474,6 +1474,30 @@ impl OpenFangKernel {
                         }
                     }
 
+                    // Migrate stale heartbeat_interval_secs baked into older manifest
+                    // blobs. The default was raised from 30 → 300 to stop idle agents
+                    // from churning Crashed→Recover. Older agents serialized intermediate
+                    // values (30, 60, 100, 150). Anything below the current default
+                    // produces a sub-10-minute unresponsiveness bound that flags healthy
+                    // idle agents. Patch any sub-300 value to 300 and persist.
+                    if let Some(ref mut auto) = restored_entry.manifest.autonomous {
+                        if auto.heartbeat_interval_secs < 300 {
+                            let old = auto.heartbeat_interval_secs;
+                            auto.heartbeat_interval_secs = 300;
+                            info!(
+                                agent = %name,
+                                old_secs = old,
+                                "Migrated stale heartbeat_interval_secs to 300"
+                            );
+                            if let Err(e) = kernel.memory.save_agent(&restored_entry) {
+                                warn!(
+                                    agent = %name,
+                                    "Failed to persist heartbeat migration: {e}"
+                                );
+                            }
+                        }
+                    }
+
                     if let Err(e) = kernel.registry.register(restored_entry) {
                         tracing::warn!(agent = %name, "Failed to restore agent: {e}");
                     } else {

@@ -1186,13 +1186,16 @@ pub struct KernelConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HeartbeatSettings {
     /// Seconds of inactivity before a reactive agent is marked as unresponsive.
-    /// Default: 180. Set higher to prevent idle hands from being marked as crashed.
+    /// Default: 1800 (30 min). Reactive agents legitimately sit idle between
+    /// user messages — a tighter bound flags healthy agents as Crashed and
+    /// triggers pointless recovery cycles. Agents that need a tighter bound
+    /// should set `AutonomousConfig.heartbeat_interval_secs` per-agent.
     #[serde(default = "default_heartbeat_timeout")]
     pub default_timeout_secs: u64,
 }
 
 fn default_heartbeat_timeout() -> u64 {
-    180
+    1800
 }
 
 impl Default for HeartbeatSettings {
@@ -4323,7 +4326,7 @@ mod tests {
     #[test]
     fn test_heartbeat_settings_default() {
         let settings = HeartbeatSettings::default();
-        assert_eq!(settings.default_timeout_secs, 180);
+        assert_eq!(settings.default_timeout_secs, 1800);
     }
 
     #[test]
@@ -4340,7 +4343,7 @@ mod tests {
             log_level = "debug"
         "#;
         let config: KernelConfig = toml::from_str(toml_str).unwrap();
-        assert_eq!(config.heartbeat.default_timeout_secs, 180);
+        assert_eq!(config.heartbeat.default_timeout_secs, 1800);
     }
 
     #[test]
