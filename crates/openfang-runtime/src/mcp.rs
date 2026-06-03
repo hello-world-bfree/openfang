@@ -82,6 +82,29 @@ pub struct McpConnection {
     /// The rmcp client handle — type-erased because the concrete type
     /// depends on which transport was used (stdio vs HTTP).
     client: RunningService<RoleClient, ClientInfo>,
+    /// Process-group id of a stdio child, captured at spawn. The child is its
+    /// own group leader (`pgid == pid`, set via `process_group(0)`), so killing
+    /// the whole group on teardown also reaps grandchildren the MCP server
+    /// itself spawned — e.g. `dbx`'s `ssh -N -L` tunnels, lightpanda's `serve`.
+    /// `None` for HTTP/SSE transports (no child) and on non-Unix.
+    child_pgid: Option<i32>,
+}
+
+#[cfg(unix)]
+impl Drop for McpConnection {
+    fn drop(&mut self) {
+        // rmcp's own child cleanup only SIGKILLs the immediate server process,
+        // and does so on a spawned tokio task that never runs during runtime
+        // teardown (daemon SIGTERM/crash). Kill the entire process group here,
+        // synchronously and inline, so the server AND its grandchildren die on
+        // every drop path. Best-effort: a gone group yields ESRCH, ignored.
+        if let Some(pgid) = self.child_pgid {
+            if pgid > 1 {
+                // SAFETY: killpg(2) on a pgid we created via process_group(0).
+                unsafe { libc::killpg(pgid as libc::pid_t, libc::SIGKILL) };
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -96,12 +119,15 @@ impl McpConnection {
             Implementation::new("openfang", env!("CARGO_PKG_VERSION")),
         );
 
-        let client = match &config.transport {
+        let (client, child_pgid) = match &config.transport {
             McpTransport::Stdio { command, args } => {
                 Self::connect_stdio(command, args, &config.env, client_info).await?
             }
             McpTransport::Sse { url } | McpTransport::Http { url } => {
-                Self::connect_http(url, &config.headers, client_info).await?
+                (
+                    Self::connect_http(url, &config.headers, client_info).await?,
+                    None,
+                )
             }
         };
 
@@ -110,6 +136,7 @@ impl McpConnection {
             tools: Vec::new(),
             original_names: HashMap::new(),
             client,
+            child_pgid,
         };
 
         // Discover tools
@@ -236,7 +263,7 @@ impl McpConnection {
         args: &[String],
         env_whitelist: &[String],
         client_info: ClientInfo,
-    ) -> Result<RunningService<RoleClient, ClientInfo>, String> {
+    ) -> Result<(RunningService<RoleClient, ClientInfo>, Option<i32>), String> {
         use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
         use tokio::process::Command;
 
@@ -249,10 +276,16 @@ impl McpConnection {
         let args_vec: Vec<String> = args.to_vec();
         let env_list: Vec<String> = env_whitelist.to_vec();
 
-        let transport = TokioChildProcess::new(Command::new(&cmd_str).configure(move |cmd| {
+        let configured = Command::new(&cmd_str).configure(move |cmd| {
             for arg in &args_vec {
                 cmd.arg(arg);
             }
+            // Put the child in its own process group (it becomes the leader,
+            // pgid == pid). Any process it spawns inherits the group, so a
+            // single group-kill on drop reaps the server AND its grandchildren
+            // (ssh tunnels, lightpanda serve) instead of orphaning them.
+            #[cfg(unix)]
+            cmd.process_group(0);
             // Sandbox: clear environment, only pass whitelisted vars
             cmd.env_clear();
             for var_name in &env_list {
@@ -282,15 +315,22 @@ impl McpConnection {
                     }
                 }
             }
-        }))
-        .map_err(|e| format!("Failed to spawn MCP server '{cmd_str}': {e}"))?;
+        });
+
+        // Spawn via the builder (not `new`) so we can read the child pid before
+        // rmcp consumes the transport into its serve loop. With process_group(0)
+        // set above, that pid is the process-group id used to reap the group.
+        let (transport, _stderr) = TokioChildProcess::builder(configured)
+            .spawn()
+            .map_err(|e| format!("Failed to spawn MCP server '{cmd_str}': {e}"))?;
+        let child_pgid = transport.id().map(|id| id as i32);
 
         let client = client_info
             .serve(transport)
             .await
             .map_err(|e| format!("MCP stdio handshake failed: {e}"))?;
 
-        Ok(client)
+        Ok((client, child_pgid))
     }
 
     /// Connect using Streamable HTTP transport (or SSE fallback via the same endpoint).

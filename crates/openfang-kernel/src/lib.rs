@@ -20,6 +20,7 @@ pub mod mcp_bridge;
 pub mod mcp_bridge_server;
 pub mod metering;
 pub mod pairing;
+pub mod process_reaper;
 pub mod registry;
 pub mod scheduler;
 pub mod supervisor;

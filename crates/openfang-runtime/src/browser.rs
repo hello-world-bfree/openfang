@@ -227,7 +227,6 @@ impl Drop for CdpConnection {
 struct BrowserSession {
     process: tokio::process::Child,
     cdp: CdpConnection,
-    #[allow(dead_code)]
     last_active: Instant,
 }
 
@@ -267,6 +266,11 @@ impl BrowserSession {
 
         let mut cmd = tokio::process::Command::new(&chrome_path);
         cmd.args(&args);
+        // Kill the child if this Child handle is dropped without an explicit
+        // teardown. Without this, any `?` between spawn and constructing the
+        // BrowserSession (CDP URL read, /json/list, WebSocket connect) orphans
+        // a live Chromium that nothing ever reaps.
+        cmd.kill_on_drop(true);
         cmd.stderr(std::process::Stdio::piped());
         cmd.stdout(std::process::Stdio::null());
         cmd.stdin(std::process::Stdio::null());
@@ -847,6 +851,43 @@ impl BrowserManager {
         self.close_session(agent_id).await;
     }
 
+    /// Close sessions idle longer than the configured `idle_timeout_secs`.
+    ///
+    /// Runs on a background timer so a session whose agent finished without
+    /// calling `browser_close` does not hold a live Chromium (and its socket
+    /// pool) open for the daemon's whole lifetime. Returns the number closed.
+    ///
+    /// A session currently executing a command holds its lock; we `try_lock`
+    /// and skip those — they are by definition not idle, and skipping avoids
+    /// blocking the sweep behind a long-running navigation.
+    pub async fn sweep_idle(&self) -> usize {
+        let timeout = self.config.idle_timeout_secs;
+        // idle_timeout_secs == 0 disables idle eviction.
+        if timeout == 0 {
+            return 0;
+        }
+
+        let mut stale: Vec<String> = Vec::new();
+        for entry in self.sessions.iter() {
+            if let Ok(guard) = entry.value().try_lock() {
+                if guard.last_active.elapsed().as_secs() > timeout {
+                    stale.push(entry.key().clone());
+                }
+            }
+        }
+
+        let mut closed = 0;
+        for agent_id in stale {
+            // Re-check under removal: close_session drops the Arc, whose last
+            // holder triggers BrowserSession::Drop → Chromium killed.
+            if self.sessions.remove(&agent_id).is_some() {
+                closed += 1;
+                info!(agent_id, "Closed idle browser session");
+            }
+        }
+        closed
+    }
+
     /// Get existing session or create a new one.
     async fn get_or_create(&self, agent_id: &str) -> Result<Arc<Mutex<BrowserSession>>, String> {
         if let Some(entry) = self.sessions.get(agent_id) {
@@ -1214,6 +1255,24 @@ mod tests {
         assert_eq!(config.idle_timeout_secs, 300);
         assert_eq!(config.max_sessions, 5);
         assert!(config.chromium_path.is_none());
+    }
+
+    #[tokio::test]
+    async fn sweep_idle_noop_on_empty_manager() {
+        let mgr = BrowserManager::new(BrowserConfig::default());
+        assert_eq!(mgr.sweep_idle().await, 0);
+    }
+
+    #[tokio::test]
+    async fn sweep_idle_disabled_when_timeout_zero() {
+        // idle_timeout_secs == 0 must short-circuit so sessions are never
+        // evicted on a timer — the opt-out contract for long-lived sessions.
+        let config = BrowserConfig {
+            idle_timeout_secs: 0,
+            ..Default::default()
+        };
+        let mgr = BrowserManager::new(config);
+        assert_eq!(mgr.sweep_idle().await, 0);
     }
 
     #[test]

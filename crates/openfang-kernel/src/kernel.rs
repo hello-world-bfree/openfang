@@ -1543,6 +1543,24 @@ impl OpenFangKernel {
             Err(e) => warn!(error = %e, "Orphan MCP config reap failed; non-fatal"),
         }
 
+        // Reap orphaned Chromium children left by a crashed/hard-killed prior
+        // daemon. The browser session Drop handles the graceful path; this is
+        // the crash backstop that stops port-exhaustion from accumulating
+        // across restarts. Matches only openfang's headless CDP signature.
+        match crate::process_reaper::reap_orphan_browsers() {
+            0 => {}
+            n => info!("Reaped {n} orphaned browser child process(es) at startup"),
+        }
+
+        // Reap orphaned MCP grandchildren (dbx ssh tunnels, lightpanda serve)
+        // stranded by a prior crash. McpConnection's group-killing Drop handles
+        // the graceful path; this is the crash backstop. Works on macOS too
+        // (ps-based), where the orphan-to-launchd port exhaustion was observed.
+        match crate::process_reaper::reap_orphan_mcp_children() {
+            0 => {}
+            n => info!("Reaped {n} orphaned MCP child process(es) at startup"),
+        }
+
         info!("OpenFang kernel booted successfully");
         Ok(kernel)
     }
@@ -4664,6 +4682,34 @@ impl OpenFangKernel {
                     }
                 }
             });
+        }
+
+        // Periodic browser idle-session sweep. Closes Chromium sessions whose
+        // agent finished without calling browser_close, so they don't hold a
+        // process + socket pool open for the daemon's lifetime.
+        {
+            let idle_timeout = self.config.browser.idle_timeout_secs;
+            if idle_timeout > 0 {
+                // Check often enough that eviction lands within ~1.5x timeout,
+                // but never hammer: floor at 30s.
+                let period = std::cmp::max(idle_timeout / 2, 30);
+                let kernel = Arc::clone(self);
+                tokio::spawn(async move {
+                    let mut interval =
+                        tokio::time::interval(std::time::Duration::from_secs(period));
+                    interval.tick().await; // Skip first immediate tick
+                    loop {
+                        interval.tick().await;
+                        if kernel.supervisor.is_shutting_down() {
+                            break;
+                        }
+                        let closed = kernel.browser_ctx.sweep_idle().await;
+                        if closed > 0 {
+                            info!("Browser idle sweep: closed {closed} idle session(s)");
+                        }
+                    }
+                });
+            }
         }
 
         // Periodic memory consolidation (decays stale memory confidence)
