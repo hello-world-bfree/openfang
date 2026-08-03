@@ -136,6 +136,8 @@ document.addEventListener('alpine:init', function() {
     agentCount: 0,
     pendingApprovalCount: 0,
     lastPendingApprovalSignature: '',
+    approvalsCache: [],
+    approvalsCacheAt: 0,
     pendingAgent: null,
     focusMode: localStorage.getItem('openfang-focus') === 'true',
     showOnboarding: false,
@@ -170,6 +172,9 @@ document.addEventListener('alpine:init', function() {
         }
         this.pendingApprovalCount = pending.length;
         this.lastPendingApprovalSignature = signature;
+        this.approvalsCache = approvals;
+        this.approvalsCacheAt = Date.now();
+        window.dispatchEvent(new CustomEvent('openfang:approvals-updated', { detail: { approvals: approvals } }));
       } catch(e) { /* silent */ }
     },
 

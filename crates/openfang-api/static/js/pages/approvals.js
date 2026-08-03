@@ -11,13 +11,28 @@ function approvalsPage() {
 
     init() {
       var self = this;
-      this.loadData();
-      this.refreshTimer = setInterval(function() {
-        self.loadData();
-      }, 5000);
+      // Seed from app-store cache if fresh (<10s), else fetch once
+      var store = (typeof Alpine !== 'undefined') ? Alpine.store('app') : null;
+      if (store && store.approvalsCache && store.approvalsCache.length >= 0 && (Date.now() - store.approvalsCacheAt) < 10000) {
+        this.approvals = store.approvalsCache;
+        this.loading = false;
+      } else {
+        this.loadData();
+      }
+      // Subscribe to global poll; no per-page interval
+      this._onApprovalsUpdated = function(ev) {
+        self.approvals = (ev.detail && ev.detail.approvals) || [];
+        self.loading = false;
+        self.loadError = '';
+      };
+      window.addEventListener('openfang:approvals-updated', this._onApprovalsUpdated);
     },
 
     destroy() {
+      if (this._onApprovalsUpdated) {
+        window.removeEventListener('openfang:approvals-updated', this._onApprovalsUpdated);
+        this._onApprovalsUpdated = null;
+      }
       if (this.refreshTimer) {
         clearInterval(this.refreshTimer);
         this.refreshTimer = null;
